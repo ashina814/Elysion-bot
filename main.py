@@ -630,6 +630,7 @@ class Salary(commands.Cog):
 
             async with self.bot.get_db() as db:
                 async with db.begin():
+                    await db.execute("INSERT OR IGNORE INTO accounts (user_id, balance, total_earned) VALUES (0, 0, 0)")
                     await db.executemany("""
                         INSERT INTO accounts (user_id, balance, total_earned) VALUES (?, ?, ?)
                         ON CONFLICT(user_id) DO UPDATE SET 
