@@ -1,4 +1,5 @@
 import discord
+import keep_alive
 from discord.ext import commands, tasks
 from discord import app_commands, ui
 import aiosqlite
@@ -1046,5 +1047,6 @@ if __name__ == "__main__":
     if not TOKEN:
         logger.error("DISCORD_TOKEN is missing")
     else:
+        keep_alive.keep_alive()
         bot = LumenBankBot()
         bot.run(TOKEN)
