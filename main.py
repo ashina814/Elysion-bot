@@ -1,5 +1,10 @@
 import discord
 import keep_alive
+import matplotlib
+matplotlib.use('Agg') # サーバー上でグラフを描くための設定
+import matplotlib.pyplot as plt
+import io
+import pandas as pd
 from discord.ext import commands, tasks
 from discord import app_commands, ui
 import aiosqlite
@@ -432,9 +437,7 @@ class PrivateVCManager(commands.Cog):
         # 完了通知 (defer済みなので followup)
         await interaction.followup.send("✅ 設定を保存し、パネルを設置しました。", ephemeral=True)
 
-
 # --- Cog: Economy (残高・送金) ---
-
 class Economy(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -511,23 +514,26 @@ class Economy(commands.Cog):
 
         try:
             async with self.bot.get_db() as db:
-                async with db.begin(): 
-                    
+                # ★修正: begin() を削除し、try-except ブロックに変更
+                try:
                     # 送信者の口座を作成（無い場合）
                     await db.execute("INSERT OR IGNORE INTO accounts (user_id, balance) VALUES (?, 0)", (sender.id,))
+                    
+                    # 残高を減らす（残高不足なら更新件数が0になる）
                     cursor = await db.execute(
                         "UPDATE accounts SET balance = balance - ? WHERE user_id = ? AND balance >= ?", 
                         (amount, sender.id, amount)
                     )
                     
-                    # 更新された行数が0なら「残高不足」ということ
+                    # 更新された行数が0なら「残高不足」
                     if cursor.rowcount == 0:
                         async with db.execute("SELECT balance FROM accounts WHERE user_id = ?", (sender.id,)) as c:
                             row = await c.fetchone()
                             curr = row['balance'] if row else 0
+                        # ここでロールバックする必要はないが、処理を中断
                         return await interaction.followup.send(f"❌ 残高が足りません。\n(送金額: {amount:,} L / 現在: {curr:,} L)", ephemeral=True)
 
-                    # 相手に振り込む
+                    # 相手の口座を作成 & 振り込む
                     await db.execute("INSERT OR IGNORE INTO accounts (user_id, balance) VALUES (?, 0)", (receiver.id,))
                     await db.execute("UPDATE accounts SET balance = balance + ? WHERE user_id = ?", (amount, receiver.id))
                     
@@ -536,6 +542,14 @@ class Economy(commands.Cog):
                         "INSERT INTO transactions (sender_id, receiver_id, amount, type, description, month_tag) VALUES (?, ?, ?, 'TRANSFER', ?, ?)",
                         (sender.id, receiver.id, amount, f"{sender.display_name}からの送金", month_tag)
                     )
+                    
+                    # ★ここで確定（コミット）
+                    await db.commit()
+
+                except Exception as db_err:
+                    # DB操作中にエラーが出たら取り消す
+                    await db.rollback()
+                    raise db_err
 
             # --- 成功後の処理 ---
 
@@ -592,6 +606,7 @@ class Economy(commands.Cog):
                 inline=False
             )
         await interaction.followup.send(embed=embed, ephemeral=True)
+
 
 # --- Cog: Salary (給与) ---
 class Salary(commands.Cog):
@@ -716,7 +731,6 @@ class Salary(commands.Cog):
             logger.error(f"Rollback Error: {e}")
             await interaction.followup.send(f"❌ ロールバック中にエラーが発生しました: {e}", ephemeral=True)
 
-
 # --- Cog: VoiceSystem  ---
 class VoiceSystem(commands.Cog):
     def __init__(self, bot):
@@ -774,14 +788,17 @@ class VoiceSystem(commands.Cog):
         user_id = member_or_id.id if isinstance(member_or_id, discord.Member) else member_or_id
         try:
             async with self.bot.get_db() as db:
+                # まず入室時間を取得
                 async with db.execute("SELECT join_time FROM voice_tracking WHERE user_id =?", (user_id,)) as cursor:
                     row = await cursor.fetchone()
                 if not row: return
 
-                async with db.begin():
+                # ★修正: db.begin() を削除し、手動コミットへ変更
+                try:
                     join_time = datetime.datetime.fromisoformat(row['join_time'])
                     sec = int((now - join_time).total_seconds())
                     
+                    # 1分未満は切り捨て
                     if sec < 60:
                         reward = 0
                     else:
@@ -789,28 +806,44 @@ class VoiceSystem(commands.Cog):
 
                     if reward > 0:
                         month_tag = now.strftime("%Y-%m")
-                        await db.execute("INSERT OR IGNORE INTO accounts (user_id) VALUES (?)", (user_id,))
+                        
+                        # 1. システム口座(ID:0)を確実に作る（エラー回避）
+                        await db.execute("INSERT OR IGNORE INTO accounts (user_id, balance, total_earned) VALUES (0, 0, 0)")
+
+                        # 2. ユーザーの口座を作る
+                        await db.execute("INSERT OR IGNORE INTO accounts (user_id, balance, total_earned) VALUES (?, 0, 0)", (user_id,))
+                        
+                        # 3. 残高と統計を更新
                         await db.execute(
                             "UPDATE accounts SET balance = balance +?, total_earned = total_earned +? WHERE user_id =?", 
                             (reward, reward, user_id)
                         )
                         await db.execute("INSERT OR IGNORE INTO voice_stats (user_id) VALUES (?)", (user_id,))
                         await db.execute("UPDATE voice_stats SET total_seconds = total_seconds +? WHERE user_id =?", (sec, user_id))
+                        
+                        # 4. 取引履歴（システムからユーザーへ）
                         await db.execute(
                             "INSERT INTO transactions (sender_id, receiver_id, amount, type, description, month_tag) VALUES (0, ?, ?, 'VC_REWARD', 'VC活動報酬', ?)",
                             (user_id, reward, month_tag)
                         )
                     
-                    # 追跡データを削除
+                    # 5. 追跡データを削除（報酬0でも削除する）
                     await db.execute("DELETE FROM voice_tracking WHERE user_id =?", (user_id,))
+                    
+                    # ★最後にコミット
+                    await db.commit()
 
-                # ログ出力
-                if reward > 0:
-                    embed = discord.Embed(title="🎙 VC報酬精算", color=discord.Color.blue(), timestamp=now)
-                    embed.add_field(name="ユーザー", value=f"<@{user_id}>")
-                    embed.add_field(name="付与額", value=f"{reward:,} L")
-                    embed.add_field(name="滞在時間", value=f"{sec // 60}分")
-                    await self.bot.send_admin_log(embed)
+                    # ログ出力（コミット成功後）
+                    if reward > 0:
+                        embed = discord.Embed(title="🎙 VC報酬精算", color=discord.Color.blue(), timestamp=now)
+                        embed.add_field(name="ユーザー", value=f"<@{user_id}>")
+                        embed.add_field(name="付与額", value=f"{reward:,} L")
+                        embed.add_field(name="滞在時間", value=f"{sec // 60}分")
+                        await self.bot.send_admin_log(embed)
+
+                except Exception as db_err:
+                    await db.rollback()
+                    raise db_err
 
         except Exception as e:
             logger.error(f"Voice Reward Process Error [{user_id}]: {e}")
@@ -847,6 +880,8 @@ class VoiceSystem(commands.Cog):
                         await self._process_reward(u_id, now)
         except Exception as e:
             logger.error(f"Recovery Error: {e}")
+
+
 
 # --- Cog: InterviewSystem  ---
 class InterviewSystem(commands.Cog):
@@ -913,7 +948,11 @@ class InterviewSystem(commands.Cog):
         month_tag = datetime.datetime.now().strftime("%Y-%m")
 
         async with self.bot.get_db() as db:
-            async with db.begin():
+            # ★修正: db.begin() を削除し、手動管理へ
+            try:
+                # 0. システム口座(ID:0)を確実に作る（エラー回避）
+                await db.execute("INSERT OR IGNORE INTO accounts (user_id, balance, total_earned) VALUES (0, 0, 0)")
+
                 for member in targets:
                     if member.bot: continue
                     
@@ -923,11 +962,16 @@ class InterviewSystem(commands.Cog):
                             await member.add_roles(role, reason="面接通過コマンドによる付与")
                         
                         # B. お金付与
+                        # 口座がなければ作る
                         await db.execute("INSERT OR IGNORE INTO accounts (user_id, balance) VALUES (?, 0)", (member.id,))
+                        
+                        # 残高追加
                         await db.execute(
                             "UPDATE accounts SET balance = balance + ?, total_earned = total_earned + ? WHERE user_id = ?", 
                             (amount, amount, member.id)
                         )
+                        
+                        # 取引履歴
                         await db.execute(
                             "INSERT INTO transactions (sender_id, receiver_id, amount, type, description, month_tag) VALUES (0, ?, ?, 'BONUS', ?, ?)",
                             (member.id, amount, f"面接通過祝い: {role.name}", month_tag)
@@ -940,6 +984,14 @@ class InterviewSystem(commands.Cog):
                     except Exception as e:
                         error_logs.append(f"❌ {member.display_name}: エラーが発生しました ({e})")
                         logger.error(f"Interview Command Error [{member.id}]: {e}")
+                
+                # ★最後にコミット（これで確定）
+                await db.commit()
+
+            except Exception as db_err:
+                await db.rollback()
+                logger.error(f"Interview Transaction Error: {db_err}")
+                return await interaction.followup.send("❌ データベースエラーが発生しました。", ephemeral=True)
 
         # 4. 結果報告Embed
         embed = discord.Embed(title="🌸 面接通過処理完了", color=discord.Color.pink())
@@ -958,6 +1010,122 @@ class InterviewSystem(commands.Cog):
             embed.add_field(name="エラーログ", value="\n".join(error_logs[:5]), inline=False)
 
         await interaction.followup.send(embed=embed)
+
+# --- Cog: ServerStats (サーバー経済統計 & グラフ) ---
+class ServerStats(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.daily_log_task.start()
+
+    def cog_unload(self):
+        self.daily_log_task.cancel()
+
+    async def get_total_balance_excluding_gods(self):
+        """最高神とシステム(ID:0)を除く、サーバー全体の総資産を計算"""
+        guild = self.bot.guilds[0] # メインサーバーを取得
+        
+        # 1. 最高神のロールIDを特定
+        god_role_ids = []
+        for r_id, level in self.bot.config.admin_roles.items():
+            if level == "SUPREME_GOD":
+                god_role_ids.append(r_id)
+        
+        # 2. 除外対象（最高神ロール持ち & システム）をリストアップ
+        exclude_user_ids = {0}
+        
+        # メンバー情報を確実に取得
+        if not guild.chunked:
+            await guild.chunk()
+            
+        for member in guild.members:
+            # 最高神ロールを持っているかチェック
+            if any(role.id in god_role_ids for role in member.roles):
+                exclude_user_ids.add(member.id)
+
+        # 3. DBから集計（一般市民の残高のみ合計）
+        total = 0
+        async with self.bot.get_db() as db:
+            async with db.execute("SELECT user_id, balance FROM accounts") as cursor:
+                rows = await cursor.fetchall()
+                
+            for row in rows:
+                if row['user_id'] not in exclude_user_ids:
+                    total += row['balance']
+        
+        return total
+
+    @tasks.loop(hours=24)
+    async def daily_log_task(self):
+        """毎日データを自動記録"""
+        now = datetime.datetime.now()
+        date_str = now.strftime("%Y-%m-%d")
+        
+        try:
+            total_balance = await self.get_total_balance_excluding_gods()
+            
+            async with self.bot.get_db() as db:
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS daily_stats (
+                        date TEXT PRIMARY KEY,
+                        total_balance INTEGER
+                    )
+                """)
+                await db.execute(
+                    "INSERT OR REPLACE INTO daily_stats (date, total_balance) VALUES (?, ?)",
+                    (date_str, total_balance)
+                )
+                await db.commit()
+            
+            logger.info(f"Daily Stats Logged: {date_str} = {total_balance:,} L")
+            
+        except Exception as e:
+            logger.error(f"Daily Stats Error: {e}")
+
+    @daily_log_task.before_loop
+    async def before_daily_log(self):
+        await self.bot.wait_until_ready()
+
+    @app_commands.command(name="economy_graph", description="一般市民の総資産推移をグラフ化します")
+    async def economy_graph(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        
+        # データを取得
+        async with self.bot.get_db() as db:
+            await db.execute("CREATE TABLE IF NOT EXISTS daily_stats (date TEXT PRIMARY KEY, total_balance INTEGER)")
+            async with db.execute("SELECT date, total_balance FROM daily_stats ORDER BY date ASC") as cursor:
+                rows = await cursor.fetchall()
+        
+        # データがまだ無いなら、今の瞬間を記録して表示
+        if not rows:
+            current_total = await self.get_total_balance_excluding_gods()
+            today = datetime.datetime.now().strftime("%Y-%m-%d")
+            rows = [{'date': today, 'total_balance': current_total}]
+            
+            async with self.bot.get_db() as db:
+                await db.execute("INSERT OR REPLACE INTO daily_stats (date, total_balance) VALUES (?, ?)", (today, current_total))
+                await db.commit()
+
+        # グラフ描画
+        dates = [r['date'] for r in rows]
+        balances = [r['total_balance'] for r in rows]
+
+        plt.figure(figsize=(10, 6))
+        plt.plot(dates, balances, marker='o', linestyle='-', color='b', label='Total Balance')
+        plt.title('Server Economy (Excluding Gods)')
+        plt.xlabel('Date')
+        plt.ylabel('Total Balance (Lumen)')
+        plt.grid(True)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+
+        # 画像をDiscordに送る準備
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        buf.seek(0)
+        plt.close()
+
+        file = discord.File(buf, filename="economy_graph.png")
+        await interaction.followup.send(f"📊 **サーバー経済推移**\n現在の一般市民総資産: {balances[-1]:,} L", file=file)
 
 # --- 3. 管理者ツール ---
 class AdminTools(commands.Cog):
@@ -1104,6 +1272,7 @@ class LumenBankBot(commands.Bot):
         await self.add_cog(AdminTools(self))
         await self.add_cog(PrivateVCManager(self))
         await self.add_cog(InterviewSystem(self))
+        await self.add_cog(ServerStats(self))
         self.backup_db_task.start()
         await self.tree.sync()
         logger.info("LumenBank System: Setup complete and Synced.")
