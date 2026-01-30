@@ -598,12 +598,14 @@ class Salary(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
+    # ▼▼▼ 修正版: 一括給与支給コマンド ▼▼▼
     @app_commands.command(name="salary_distribute_all", description="【最高神】一括給与支給")
     @has_permission("SUPREME_GOD")
     async def distribute_all(self, interaction: discord.Interaction):
         await interaction.response.defer()
         now = datetime.datetime.now()
         month_tag = now.strftime("%Y-%m")
+        # 識別ID（ロールバック用）を生成
         batch_id = str(uuid.uuid4())[:8]
         
         wage_dict = self.bot.config.role_wages 
@@ -612,14 +614,19 @@ class Salary(commands.Cog):
         account_updates, transaction_records = [], []
 
         try:
+            # メンバーリストを取得
             members = interaction.guild.members if interaction.guild.chunked else [m async for m in interaction.guild.fetch_members()]
 
             for member in members:
                 if member.bot: continue
+                # 設定された役職を持っているかチェック
                 matching_wages = [wage_dict[r.id] for r in member.roles if r.id in wage_dict]
                 if not matching_wages: continue
                 
+                # 一番高い給与を採用
                 wage = max(matching_wages)
+                
+                # DB更新用データを作成
                 account_updates.append((member.id, wage, wage))
                 transaction_records.append((0, member.id, wage, 'SALARY', batch_id, month_tag, f"{month_tag} 給与"))
                 count += 1
@@ -628,24 +635,87 @@ class Salary(commands.Cog):
             if not account_updates:
                 return await interaction.followup.send("対象となる役職を持つメンバーがいませんでした。")
 
+            # データベース処理（安全装置付き）
             async with self.bot.get_db() as db:
-                async with db.begin():
+                try:
+                    # 1. まずシステム口座（ID:0）を確実に作る（エラー回避）
                     await db.execute("INSERT OR IGNORE INTO accounts (user_id, balance, total_earned) VALUES (0, 0, 0)")
+                    
+                    # 2. 全員の残高を更新
                     await db.executemany("""
                         INSERT INTO accounts (user_id, balance, total_earned) VALUES (?, ?, ?)
                         ON CONFLICT(user_id) DO UPDATE SET 
                         balance = balance + excluded.balance,
                         total_earned = total_earned + excluded.total_earned
                     """, account_updates)
+                    
+                    # 3. 取引履歴を記録
                     await db.executemany("""
                         INSERT INTO transactions (sender_id, receiver_id, amount, type, batch_id, month_tag, description)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                     """, transaction_records)
+                    
+                    # 4. ここまでエラーがなければ確定（セーブ）
+                    await db.commit()
+                    
+                except Exception as db_err:
+                    # 途中でエラーが起きたら、変更を全部なかったことにする（ロールバック）
+                    await db.rollback()
+                    raise db_err
 
-            await interaction.followup.send(f"💰 **一括支給完了**\n対象: {count}名\n総額: {total_amount:,} L\n識別ID: `{batch_id}`")
+            await interaction.followup.send(f"💰 **一括支給完了**\n対象: {count}名\n総額: {total_amount:,} L\n識別ID: `{batch_id}`\n(※万が一間違えた場合は `/salary_rollback {batch_id}` で取り消せます)")
+            
         except Exception as e:
             logger.error(f"Salary Error: {e}")
-            await interaction.followup.send("❌ 支給中にエラーが発生しました。", ephemeral=True)
+            await interaction.followup.send(f"❌ 支給中にエラーが発生しました: {e}", ephemeral=True)
+
+
+    # ▼▼▼ 追加機能: 給与取り消し（ロールバック）コマンド ▼▼▼
+    @app_commands.command(name="salary_rollback", description="【最高神】指定した識別ID(Batch ID)の給与支給を取り消します")
+    @app_commands.describe(batch_id="取り消したい支給の識別ID（支給完了時に表示されます）")
+    @has_permission("SUPREME_GOD")
+    async def salary_rollback(self, interaction: discord.Interaction, batch_id: str):
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            async with self.bot.get_db() as db:
+                # 指定されたIDの給与データを検索
+                async with db.execute("SELECT receiver_id, amount FROM transactions WHERE batch_id = ? AND type = 'SALARY'", (batch_id,)) as cursor:
+                    rows = await cursor.fetchall()
+                
+                if not rows:
+                    return await interaction.followup.send(f"❌ 指定されたID `{batch_id}` の給与データが見つかりません。", ephemeral=True)
+                
+                count = 0
+                total_reverted = 0
+                
+                try:
+                    # 1. 配ったお金を各ユーザーから回収する
+                    for row in rows:
+                        uid = row['receiver_id']
+                        amt = row['amount']
+                        # 残高と累計獲得額の両方から引く
+                        await db.execute("UPDATE accounts SET balance = balance - ?, total_earned = total_earned - ? WHERE user_id = ?", (amt, amt, uid))
+                        count += 1
+                        total_reverted += amt
+                    
+                    # 2. 取引履歴を削除する（なかったことにする）
+                    await db.execute("DELETE FROM transactions WHERE batch_id = ?", (batch_id,))
+                    
+                    # 3. 確定
+                    await db.commit()
+                    
+                except Exception as db_err:
+                    await db.rollback()
+                    raise db_err
+
+            # 完了報告
+            await interaction.followup.send(f"↩️ **ロールバック完了**\n識別ID `{batch_id}` の支給を取り消しました。\n対象: {count}件\n回収額: {total_reverted:,} L", ephemeral=True)
+
+        except Exception as e:
+            logger.error(f"Rollback Error: {e}")
+            await interaction.followup.send(f"❌ ロールバック中にエラーが発生しました: {e}", ephemeral=True)
+
 
 # --- Cog: VoiceSystem  ---
 class VoiceSystem(commands.Cog):
@@ -897,39 +967,53 @@ class AdminTools(commands.Cog):
     @app_commands.command(name="config_set_log_channel", description="【最高神】監査ログ（証拠）の出力先を設定します")
     @has_permission("SUPREME_GOD")
     async def set_log_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        # タイムアウト対策
+        await interaction.response.defer(ephemeral=True)
+        
         async with self.bot.get_db() as db:
             await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES ('log_channel_id', ?)", (str(channel.id),))
             await db.commit()
-        await interaction.response.send_message(f"✅ 以降、全ての重要ログを {channel.mention} に送信します。")
+        
+        # deferした後は followup.send を使う
+        await interaction.followup.send(f"✅ 以降、全ての重要ログを {channel.mention} に送信します。", ephemeral=True)
 
     @app_commands.command(name="config_set_admin", description="【オーナー用】管理権限ロールを登録・更新します")
     async def config_set_admin(self, interaction: discord.Interaction, role: discord.Role, level: str):
+        # ここも先に待機中にする
+        await interaction.response.defer(ephemeral=True)
+
         if not await self.bot.is_owner(interaction.user):
-            return await interaction.response.send_message("オーナーのみ実行可能です。", ephemeral=True)
+            return await interaction.followup.send("オーナーのみ実行可能です。", ephemeral=True)
         
         valid_levels = ["SUPREME_GOD", "GODDESS", "ADMIN"]
         if level not in valid_levels:
-             return await interaction.response.send_message(f"レベルは {valid_levels} のいずれかである必要があります。", ephemeral=True)
+             return await interaction.followup.send(f"レベルは {valid_levels} のいずれかである必要があります。", ephemeral=True)
 
         async with self.bot.get_db() as db:
             await db.execute("INSERT OR REPLACE INTO admin_roles (role_id, perm_level) VALUES (?, ?)", (role.id, level))
             await db.commit()
         await self.bot.config.reload()
         
-        await interaction.response.send_message(f"✅ {role.mention} を `{level}` に設定しました。")
+        await interaction.followup.send(f"✅ {role.mention} を `{level}` に設定しました。", ephemeral=True)
 
     @app_commands.command(name="config_set_wage", description="【最高神】役職ごとの給与額を設定します")
     @has_permission("SUPREME_GOD")
     async def config_set_wage(self, interaction: discord.Interaction, role: discord.Role, amount: int):
+        # ★エラーが出ていた箇所。deferを追加して修正★
+        await interaction.response.defer(ephemeral=True)
+        
         async with self.bot.get_db() as db:
             await db.execute("INSERT OR REPLACE INTO role_wages (role_id, amount) VALUES (?, ?)", (role.id, amount))
             await db.commit()
         await self.bot.config.reload()
-        await interaction.response.send_message(f"✅ 設定を更新しました。")
+        
+        await interaction.followup.send(f"✅ 設定を更新しました。", ephemeral=True)
 
     @app_commands.command(name="vc_reward_add", description="【最高神】報酬対象のVCを追加します")
     @has_permission("SUPREME_GOD")
     async def add_reward_vc(self, interaction: discord.Interaction, channel: discord.VoiceChannel):
+        await interaction.response.defer(ephemeral=True)
+        
         async with self.bot.get_db() as db:
             # 重複無視で挿入
             await db.execute("INSERT OR IGNORE INTO reward_channels (channel_id) VALUES (?)", (channel.id,))
@@ -940,11 +1024,13 @@ class AdminTools(commands.Cog):
         if vc_cog:
             await vc_cog.reload_targets()
 
-        await interaction.response.send_message(f"✅ {channel.mention} を報酬対象に追加しました。")
+        await interaction.followup.send(f"✅ {channel.mention} を報酬対象に追加しました。", ephemeral=True)
 
     @app_commands.command(name="vc_reward_remove", description="【最高神】報酬対象のVCを解除します")
     @has_permission("SUPREME_GOD")
     async def remove_reward_vc(self, interaction: discord.Interaction, channel: discord.VoiceChannel):
+        await interaction.response.defer(ephemeral=True)
+
         async with self.bot.get_db() as db:
             await db.execute("DELETE FROM reward_channels WHERE channel_id = ?", (channel.id,))
             await db.commit()
@@ -954,23 +1040,24 @@ class AdminTools(commands.Cog):
         if vc_cog:
             await vc_cog.reload_targets()
 
-        await interaction.response.send_message(f"🗑️ {channel.mention} を報酬対象から除外しました。")
+        await interaction.followup.send(f"🗑️ {channel.mention} を報酬対象から除外しました。", ephemeral=True)
 
     @app_commands.command(name="vc_reward_list", description="【最高神】報酬対象のVC一覧を表示します")
     @has_permission("SUPREME_GOD")
     async def list_reward_vcs(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
         async with self.bot.get_db() as db:
             async with db.execute("SELECT channel_id FROM reward_channels") as cursor:
                 rows = await cursor.fetchall()
         
         if not rows:
-            return await interaction.response.send_message("報酬対象のVCは設定されていません。")
+            return await interaction.followup.send("報酬対象のVCは設定されていません。", ephemeral=True)
 
         # チャンネルリンクを作成して表示
         channels_text = "\n".join([f"• <#{row['channel_id']}>" for row in rows])
         embed = discord.Embed(title="🎙 報酬対象VC一覧", description=channels_text, color=discord.Color.green())
-        await interaction.response.send_message(embed=embed)
-
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 # --- Bot 本体 ---
 class LumenBankBot(commands.Bot):
