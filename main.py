@@ -305,7 +305,7 @@ class PlanSelect(discord.ui.Select):
             if not category:
                 new_vc = await guild.create_voice_channel(name=channel_name, overwrites=overwrites, user_limit=2)
             else:
-                new_vc = await guild.create_voice_channel(name=channel_name, category=category, overwrites=overwrites, user_limit=5)
+                new_vc = await guild.create_voice_channel(name=channel_name, category=category, overwrites=overwrites, user_limit=2)
 
             # DB登録
             expire_dt = datetime.datetime.now() + datetime.timedelta(hours=hours)
