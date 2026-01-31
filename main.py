@@ -541,7 +541,7 @@ class Economy(commands.Cog):
         latency = round(self.bot.latency * 1000)
         await interaction.response.send_message(f"🏓 Pong! Latency: `{latency}ms`", ephemeral=True)
 
-    @app_commands.command(name="balance", description="残高を確認します")
+    @app_commands.command(name="残高確認", description="残高を確認します")
     async def balance(self, interaction: discord.Interaction, member: Optional[discord.Member] = None):
         await interaction.response.defer(ephemeral=True)
 
@@ -578,7 +578,7 @@ class Economy(commands.Cog):
         
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="transfer", description="送金処理（確認あり）")
+    @app_commands.command(name="送金", description="送金処理")
     async def transfer(self, interaction: discord.Interaction, receiver: discord.Member, amount: int):
         # まずは基本的なチェックだけして、確認ボタンを出す
         if amount <= 0: return await interaction.response.send_message("❌ 1 Ru 以上を指定してください。", ephemeral=True)
@@ -595,7 +595,7 @@ class Economy(commands.Cog):
         view = TransferConfirmView(self.bot, interaction.user, receiver, amount)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-    @app_commands.command(name="history", description="直近の全ての入出金履歴を表示します")
+    @app_commands.command(name="履歴", description="直近の全ての入出金履歴を表示します")
     async def history(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         async with self.bot.get_db() as db:
@@ -624,123 +624,7 @@ class Economy(commands.Cog):
             )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-# --- Cog: Salary (給与) ---
-class Salary(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
 
-    # ▼▼▼ 修正版: 一括給与支給（詳細ログ対応） ▼▼▼
-    @app_commands.command(name="salary_distribute_all", description="【最高神】一括給与支給")
-    @has_permission("SUPREME_GOD")
-    async def distribute_all(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        
-        now = datetime.datetime.now()
-        month_tag = now.strftime("%Y-%m")
-        batch_id = str(uuid.uuid4())[:8]
-        
-        wage_dict = self.bot.config.role_wages 
-        
-        # 集計用変数
-        count = 0
-        total_amount = 0
-        role_breakdown = {} # { "ロール名": { "count": 0, "amount": 0, "mention": "@Role" } }
-        
-        account_updates = []
-        transaction_records = []
-
-        try:
-            # メンバーリストを取得
-            members = interaction.guild.members if interaction.guild.chunked else [m async for m in interaction.guild.fetch_members()]
-
-            for member in members:
-                if member.bot: continue
-                
-                # 給与対象のロールを持っているかチェック
-                matching_wages = []
-                for r in member.roles:
-                    if r.id in wage_dict:
-                        matching_wages.append((wage_dict[r.id], r))
-                
-                if not matching_wages: continue
-                
-                # 一番高い給与のロールを採用
-                wage, role = max(matching_wages, key=lambda x: x[0])
-                
-                # DB更新用データ
-                account_updates.append((member.id, wage, wage))
-                transaction_records.append((0, member.id, wage, 'SALARY', batch_id, month_tag, f"{month_tag} 給与"))
-                
-                # 統計データ更新
-                count += 1
-                total_amount += wage
-                
-                if role.name not in role_breakdown:
-                    role_breakdown[role.name] = {"count": 0, "amount": 0, "mention": role.mention}
-                role_breakdown[role.name]["count"] += 1
-                role_breakdown[role.name]["amount"] += wage
-
-            if not account_updates:
-                return await interaction.followup.send("対象となる役職を持つメンバーがいませんでした。")
-
-            # データベース処理
-            async with self.bot.get_db() as db:
-                try:
-                    # 1. システム口座確保
-                    await db.execute("INSERT OR IGNORE INTO accounts (user_id, balance, total_earned) VALUES (0, 0, 0)")
-                    
-                    # 2. 残高更新
-                    await db.executemany("""
-                        INSERT INTO accounts (user_id, balance, total_earned) VALUES (?, ?, ?)
-                        ON CONFLICT(user_id) DO UPDATE SET 
-                        balance = balance + excluded.balance,
-                        total_earned = total_earned + excluded.total_earned
-                    """, account_updates)
-                    
-                    # 3. 履歴記録
-                    await db.executemany("""
-                        INSERT INTO transactions (sender_id, receiver_id, amount, type, batch_id, month_tag, description)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, transaction_records)
-                    
-                    await db.commit()
-                    
-                except Exception as db_err:
-                    await db.rollback()
-                    raise db_err
-
-            # 実行者への簡易報告
-            await interaction.followup.send(f"💰 **一括支給完了** (ID: `{batch_id}`)\n人数: {count}名 / 総額: {total_amount:,} L")
-
-            # ★ここが追加部分：給与ログ出力（詳細レポート）
-            log_ch_id = None
-            async with self.bot.get_db() as db:
-                async with db.execute("SELECT value FROM server_config WHERE key = 'salary_log_id'") as c:
-                    row = await c.fetchone()
-                    if row: log_ch_id = int(row['value'])
-
-            if log_ch_id:
-                channel = self.bot.get_channel(log_ch_id)
-                if channel:
-                    embed = discord.Embed(title="給与一斉送信", description="給与一斉送信が実行されました。", color=0xFFD700, timestamp=now)
-                    embed.add_field(name="実行者", value=interaction.user.mention, inline=False)
-                    embed.add_field(name="合計支給", value=f"**{total_amount:,} Ru**", inline=False)
-                    embed.add_field(name="対象人数", value=f"{count} 人", inline=False)
-                    
-                    # ロール別内訳を表示
-                    breakdown_text = ""
-                    for r_name, data in role_breakdown.items():
-                        breakdown_text += f"✅ {data['mention']}\n金額: {data['amount']:,} Ru / 人数: {data['count']}名\n"
-                    
-                    if breakdown_text:
-                        embed.add_field(name="ロール別内訳", value=breakdown_text, inline=False)
-                    
-                    embed.set_footer(text=f"BatchID: {batch_id}")
-                    await channel.send(embed=embed)
-            
-        except Exception as e:
-            logger.error(f"Salary Error: {e}")
-            await interaction.followup.send(f"❌ エラーが発生しました: {e}", ephemeral=True)
 # --- Cog: Salary (給与) ---
 class Salary(commands.Cog):
     def __init__(self, bot):
@@ -867,7 +751,7 @@ class Salary(commands.Cog):
 
 
     # ▼▼▼ ロールバック（変更なし） ▼▼▼
-    @app_commands.command(name="salary_rollback", description="【最高神】指定した識別ID(Batch ID)の給与支給を取り消します")
+    @app_commands.command(name="一括給与取り消し", description="【最高神】指定した識別ID(Batch ID)の給与支給を取り消します")
     @app_commands.describe(batch_id="取り消したい支給の識別ID（支給完了時に表示されます）")
     @has_permission("SUPREME_GOD")
     async def salary_rollback(self, interaction: discord.Interaction, batch_id: str):
@@ -1081,7 +965,7 @@ class InterviewSystem(commands.Cog):
     @app_commands.command(name="面接通過", description="指定ユーザー or 同じVCのメンバー全員にロールと初期資金を付与します")
     @app_commands.describe(
         role="付与するロール",
-        amount="初期付与額（デフォルト: 30,000）",
+        amount="初期付与額（デフォルト: 10,000）",
         target="対象ユーザー（指定しない場合は、あなたと同じVCにいる全員が対象になります）"
     )
     @has_permission("ADMIN")
@@ -1237,64 +1121,100 @@ class ServerStats(commands.Cog):
     def cog_unload(self):
         self.daily_log_task.cancel()
 
-    async def get_total_balance_excluding_gods(self):
-        """最高神とシステム(ID:0)を除く、サーバー全体の総資産を計算"""
-        guild = self.bot.guilds[0] # メインサーバーを取得
+    # --- ヘルパー関数: 「アクティブな市民」の所持金リストを取得 ---
+    async def get_citizen_balances(self):
+        """
+        以下の条件を全て満たす人の所持金リストを取得する
+        1. 最高神ではない
+        2. 市民ロールを持っている（設定がある場合）
+        3. 直近〇〇日以内に取引履歴がある（設定がある場合）
+        """
+        guild = self.bot.guilds[0]
         
-        # 1. 最高神のロールIDを特定
+        # 1. 設定値の読み込み
         god_role_ids = []
-        for r_id, level in self.bot.config.admin_roles.items():
-            if level == "SUPREME_GOD":
-                god_role_ids.append(r_id)
+        citizen_role_id = None
+        active_threshold_days = 30 # デフォルトは30日（給料サイクル意識）
         
-        # 2. 除外対象（最高神ロール持ち & システム）をリストアップ
-        exclude_user_ids = {0}
+        async with self.bot.get_db() as db:
+            # 最高神ロール
+            for r_id, level in self.bot.config.admin_roles.items():
+                if level == "SUPREME_GOD":
+                    god_role_ids.append(r_id)
+            
+            # 各種設定ロード
+            async with db.execute("SELECT key, value FROM server_config") as cursor:
+                rows = await cursor.fetchall()
+                for row in rows:
+                    if row['key'] == 'citizen_role_id':
+                        citizen_role_id = int(row['value'])
+                    elif row['key'] == 'active_threshold_days':
+                        active_threshold_days = int(row['value'])
+
+        # 2. アクティブユーザーの特定（DBから高速判定）
+        active_user_ids = set()
+        cutoff_date = datetime.datetime.now() - datetime.timedelta(days=active_threshold_days)
         
-        # メンバー情報を確実に取得
+        async with self.bot.get_db() as db:
+            # 指定期間内に「送金した」or「受け取った」人をリストアップ
+            sql = "SELECT DISTINCT sender_id, receiver_id FROM transactions WHERE created_at > ?"
+            async with db.execute(sql, (cutoff_date,)) as cursor:
+                rows = await cursor.fetchall()
+                for row in rows:
+                    active_user_ids.add(row['sender_id'])
+                    active_user_ids.add(row['receiver_id'])
+
+        # 3. メンバーの選別
+        balances = []
+        
+        # 所持金辞書
+        user_balances = {}
+        async with self.bot.get_db() as db:
+            async with db.execute("SELECT user_id, balance FROM accounts") as cursor:
+                rows = await cursor.fetchall()
+                for row in rows:
+                    user_balances[row['user_id']] = row['balance']
+
         if not guild.chunked:
             await guild.chunk()
             
         for member in guild.members:
-            # 最高神ロールを持っているかチェック
+            if member.bot: continue
+
+            # A. 最高神は除外
             if any(role.id in god_role_ids for role in member.roles):
-                exclude_user_ids.add(member.id)
+                continue
+            
+            # B. 市民ロールチェック
+            if citizen_role_id:
+                if not any(role.id == citizen_role_id for role in member.roles):
+                    continue 
 
-        # 3. DBから集計（一般市民の残高のみ合計）
-        total = 0
-        async with self.bot.get_db() as db:
-            async with db.execute("SELECT user_id, balance FROM accounts") as cursor:
-                rows = await cursor.fetchall()
-                
-            for row in rows:
-                if row['user_id'] not in exclude_user_ids:
-                    total += row['balance']
+            # C. アクティブチェック（★ここが追加点）
+            # 取引履歴にIDがない ＝ 期間中ずっと寝てた人
+            if member.id not in active_user_ids:
+                continue
+            
+            # 全条件クリア！
+            bal = user_balances.get(member.id, 0)
+            balances.append(bal)
         
-        return total
+        return balances, active_threshold_days # 日数も返す（表示用）
 
+    # --- 毎日ログ ---
     @tasks.loop(hours=24)
     async def daily_log_task(self):
-        """毎日データを自動記録"""
         now = datetime.datetime.now()
         date_str = now.strftime("%Y-%m-%d")
-        
         try:
-            total_balance = await self.get_total_balance_excluding_gods()
+            balances, _ = await self.get_citizen_balances()
+            total_balance = sum(balances)
             
             async with self.bot.get_db() as db:
-                await db.execute("""
-                    CREATE TABLE IF NOT EXISTS daily_stats (
-                        date TEXT PRIMARY KEY,
-                        total_balance INTEGER
-                    )
-                """)
-                await db.execute(
-                    "INSERT OR REPLACE INTO daily_stats (date, total_balance) VALUES (?, ?)",
-                    (date_str, total_balance)
-                )
+                await db.execute("CREATE TABLE IF NOT EXISTS daily_stats (date TEXT PRIMARY KEY, total_balance INTEGER)")
+                await db.execute("INSERT OR REPLACE INTO daily_stats (date, total_balance) VALUES (?, ?)", (date_str, total_balance))
                 await db.commit()
-            
             logger.info(f"Daily Stats Logged: {date_str} = {total_balance:,} L")
-            
         except Exception as e:
             logger.error(f"Daily Stats Error: {e}")
 
@@ -1302,48 +1222,118 @@ class ServerStats(commands.Cog):
     async def before_daily_log(self):
         await self.bot.wait_until_ready()
 
-    @app_commands.command(name="economy_graph", description="【管理者】一般市民の総資産推移をグラフ化します")
-    @has_permission("ADMIN") # ★ここ！管理者以外は使えないようにロックを追加
+    # --- グラフコマンド ---
+    @app_commands.command(name="economy_graph", description="【管理者】経済状況・インフレ率・格差・活発度を表示")
+    @has_permission("ADMIN")
     async def economy_graph(self, interaction: discord.Interaction):
         await interaction.response.defer()
         
-        # データを取得
+        today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+        
+        # 1. 資産データ取得（アクティブ日数も受け取る）
+        balances, active_days = await self.get_citizen_balances()
+        current_total = sum(balances)
+        citizen_count = len(balances)
+        
+        # 2. ジニ係数
+        gini_val = 0.0
+        gini_comment = "データなし"
+        gini_text = "測定不能"
+        
+        if balances and current_total > 0:
+            sorted_balances = sorted(balances)
+            n = len(balances)
+            numerator = 2 * sum((i + 1) * val for i, val in enumerate(sorted_balances))
+            denominator = n * current_total
+            gini_val = (numerator / denominator) - (n + 1) / n
+            
+            if gini_val < 0.2: gini_comment = "🟢 **超平等** (社会主義的ユートピア)"
+            elif gini_val < 0.3: gini_comment = "🟢 **平和** (安定した経済)"
+            elif gini_val < 0.4: gini_comment = "🟡 **普通** (よくある資本主義)"
+            elif gini_val < 0.5: gini_comment = "🟠 **警戒** (富の集中が始まっています)"
+            elif gini_val < 0.6: gini_comment = "🔴 **危険** (暴動が起きるレベル)"
+            else: gini_comment = "💀 **崩壊** (王と奴隷の世界)"
+            gini_text = f"{gini_val:.3f}"
+
+        # 3. 経済の活発度
+        tx_count = 0
+        tx_comment = ""
+        yesterday_time = datetime.datetime.now() - datetime.timedelta(days=1)
+        
         async with self.bot.get_db() as db:
             await db.execute("CREATE TABLE IF NOT EXISTS daily_stats (date TEXT PRIMARY KEY, total_balance INTEGER)")
+            await db.execute("INSERT OR REPLACE INTO daily_stats (date, total_balance) VALUES (?, ?)", (today_str, current_total))
+            await db.commit()
+            
             async with db.execute("SELECT date, total_balance FROM daily_stats ORDER BY date ASC") as cursor:
                 rows = await cursor.fetchall()
+
+            async with db.execute("SELECT COUNT(*) as cnt FROM transactions WHERE created_at > ?", (yesterday_time,)) as cursor:
+                row = await cursor.fetchone()
+                tx_count = row['cnt'] if row else 0
+
+        if tx_count == 0: tx_comment = "💀 **死** (誰も使っていません)"
+        elif tx_count < 5: tx_comment = "🧊 **停滞** (動きが鈍いです)"
+        elif tx_count < 20: tx_comment = "🚶 **微動** (ボチボチです)"
+        elif tx_count < 50: tx_comment = "🏃 **活発** (経済回ってます！)"
+        else: tx_comment = "🔥 **過熱** (凄まじい取引量です)"
+
+        # 4. インフレ率
+        inflation_text = "データ不足"
+        diff_amount = 0
         
-        # データがまだ無いなら、今の瞬間を記録して表示
-        if not rows:
-            current_total = await self.get_total_balance_excluding_gods()
-            today = datetime.datetime.now().strftime("%Y-%m-%d")
-            rows = [{'date': today, 'total_balance': current_total}]
+        if len(rows) >= 2:
+            today_data = rows[-1]
+            prev_data = rows[-2]
+            yesterday_total = prev_data['total_balance']
+            today_total = today_data['total_balance']
+            diff_amount = today_total - yesterday_total
             
-            async with self.bot.get_db() as db:
-                await db.execute("INSERT OR REPLACE INTO daily_stats (date, total_balance) VALUES (?, ?)", (today, current_total))
-                await db.commit()
+            if yesterday_total > 0:
+                rate = (diff_amount / yesterday_total) * 100
+                sign = "+" if rate >= 0 else ""
+                emoji = "📈" if rate > 0 else "📉" if rate < 0 else "➡️"
+                inflation_text = f"{emoji} **{sign}{rate:.2f}%**"
+            else:
+                inflation_text = "♾️ (前回0)"
+        else:
+             inflation_text = "🔰 データ収集中"
 
-        # グラフ描画
-        dates = [r['date'] for r in rows]
-        balances = [r['total_balance'] for r in rows]
-
-        plt.figure(figsize=(10, 6))
-        plt.plot(dates, balances, marker='o', linestyle='-', color='b', label='Total Balance')
-        plt.title('Server Economy (Excluding Gods)')
-        plt.xlabel('Date')
-        plt.ylabel('Total Balance (Lumen)')
-        plt.grid(True)
+        # 5. グラフ
+        dates = [r['date'][5:] for r in rows]
+        totals = [r['total_balance'] for r in rows]
+        
+        plt.figure(figsize=(10, 5))
+        plt.plot(dates, totals, marker='o', linestyle='-', color='#00b0f4', linewidth=2)
+        plt.title(f'Economy Growth ({rows[0]["date"]} - {today_str})')
+        plt.grid(True, linestyle='--', alpha=0.7)
         plt.xticks(rotation=45)
         plt.tight_layout()
-
-        # 画像をDiscordに送る準備
+        
         buf = io.BytesIO()
         plt.savefig(buf, format='png')
         buf.seek(0)
         plt.close()
-
         file = discord.File(buf, filename="economy_graph.png")
-        await interaction.followup.send(f"📊 **サーバー経済推移**\n現在の一般市民総資産: {balances[-1]:,} L", file=file)
+
+        # 6. レポートEmbed
+        embed = discord.Embed(title="📊 ルーメン経済レポート", color=discord.Color.blue(), timestamp=datetime.datetime.now())
+        embed.set_thumbnail(url=interaction.guild.icon.url if interaction.guild.icon else None)
+        
+        embed.add_field(name="🔄 経済の回転 (24h取引数)", value=f"{tx_comment}\n(回数: `{tx_count}回`)", inline=False)
+        embed.add_field(name="💹 経済成長率 (前回比)", value=f"# {inflation_text}", inline=True)
+        embed.add_field(name="⚖️ 格差レベル (ジニ係数)", value=f"{gini_comment}\n(`{gini_text}`)", inline=True)
+        
+        # ターゲット説明をフッターに追加
+        footer_text = f"※集計対象: 過去{active_days}日以内に取引がある市民"
+        
+        diff_sign = "+" if diff_amount >= 0 else ""
+        embed.add_field(name=f"💰 アクティブ総資産 ({citizen_count}名)", value=f"{current_total:,} L\n({diff_sign}{diff_amount:,} L)", inline=False)
+
+        embed.set_image(url="attachment://economy_graph.png")
+        embed.set_footer(text=footer_text)
+
+        await interaction.followup.send(embed=embed, file=file)
 
 # --- 3. 管理者ツール ---
 class AdminTools(commands.Cog):
@@ -1351,7 +1341,7 @@ class AdminTools(commands.Cog):
         self.bot = bot
 
     # ▼▼▼ 1. ログ出力先設定（3種類対応版） ▼▼▼
-    @app_commands.command(name="config_log_channel", description="各ログの出力先を設定します")
+    @app_commands.command(name="ログ出力先決定", description="各ログの出力先を設定します")
     @app_commands.choices(log_type=[
         discord.app_commands.Choice(name="通貨ログ (送金など)", value="currency_log_id"),
         discord.app_commands.Choice(name="給与ログ (一斉支給)", value="salary_log_id"),
@@ -1367,7 +1357,7 @@ class AdminTools(commands.Cog):
         await interaction.followup.send(f"✅ **{channel.mention}** をログ出力先に設定しました。", ephemeral=True)
 
     # ▼▼▼ 2. 面接の除外ロール設定（★これが抜けてました！） ▼▼▼
-    @app_commands.command(name="config_exclude_role", description="【最高神】面接コマンドでスキップするロール（説明者など）を設定")
+    @app_commands.command(name="面接の除外ロール設定", description="【最高神】面接コマンドでスキップするロール（説明者など）を設定")
     @has_permission("SUPREME_GOD")
     async def config_exclude_role(self, interaction: discord.Interaction, role: discord.Role):
         await interaction.response.defer(ephemeral=True)
@@ -1378,7 +1368,7 @@ class AdminTools(commands.Cog):
         await interaction.followup.send(f"✅ 面接時に **{role.name}** を持つメンバーを除外（スキップ）するように設定しました。", ephemeral=True)
 
     #▼▼▼ 3. 管理者権限設定 ▼▼▼
-    @app_commands.command(name="config_set_admin", description="【オーナー用】管理権限ロールを登録・更新します")
+    @app_commands.command(name="管理者権限設定", description="【オーナー用】管理権限ロールを登録・更新します")
     async def config_set_admin(self, interaction: discord.Interaction, role: discord.Role, level: str):
         await interaction.response.defer(ephemeral=True)
         if not await self.bot.is_owner(interaction.user):
@@ -1395,7 +1385,7 @@ class AdminTools(commands.Cog):
         await interaction.followup.send(f"✅ {role.mention} を `{level}` に設定しました。", ephemeral=True)
 
     # ▼▼▼ 4. 給与額設定 ▼▼▼
-    @app_commands.command(name="config_set_wage", description="【最高神】役職ごとの給与額を設定します")
+    @app_commands.command(name="給与額設定", description="【最高神】役職ごとの給与額を設定します")
     @has_permission("SUPREME_GOD")
     async def config_set_wage(self, interaction: discord.Interaction, role: discord.Role, amount: int):
         await interaction.response.defer(ephemeral=True)
@@ -1406,7 +1396,7 @@ class AdminTools(commands.Cog):
         await interaction.followup.send(f"✅ 設定を更新しました。", ephemeral=True)
 
     # ▼▼▼ 5. VC報酬設定エリア ▼▼▼
-    @app_commands.command(name="vc_reward_add", description="【最高神】報酬対象のVCを追加します")
+    @app_commands.command(name="vc報酬追加", description="【最高神】報酬対象のVCを追加します")
     @has_permission("SUPREME_GOD")
     async def add_reward_vc(self, interaction: discord.Interaction, channel: discord.VoiceChannel):
         await interaction.response.defer(ephemeral=True)
@@ -1418,7 +1408,7 @@ class AdminTools(commands.Cog):
         if vc_cog: await vc_cog.reload_targets()
         await interaction.followup.send(f"✅ {channel.mention} を報酬対象に追加しました。", ephemeral=True)
 
-    @app_commands.command(name="vc_reward_remove", description="【最高神】報酬対象のVCを解除します")
+    @app_commands.command(name="vc報酬解除", description="【最高神】報酬対象のVCを解除します")
     @has_permission("SUPREME_GOD")
     async def remove_reward_vc(self, interaction: discord.Interaction, channel: discord.VoiceChannel):
         await interaction.response.defer(ephemeral=True)
@@ -1442,6 +1432,31 @@ class AdminTools(commands.Cog):
         channels_text = "\n".join([f"• <#{row['channel_id']}>" for row in rows])
         embed = discord.Embed(title="🎙 報酬対象VC一覧", description=channels_text, color=discord.Color.green())
         await interaction.followup.send(embed=embed, ephemeral=True)
+    # ▼▼▼ 追加: 市民ロール（集計対象）の設定 ▼▼▼
+    @app_commands.command(name="経済集計ロール付与", description="【最高神】経済統計の対象とする「市民ロール」を設定します")
+    @has_permission("SUPREME_GOD")
+    async def config_citizen_role(self, interaction: discord.Interaction, role: discord.Role):
+        await interaction.response.defer(ephemeral=True)
+        async with self.bot.get_db() as db:
+            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES ('citizen_role_id', ?)", (str(role.id),))
+            await db.commit()
+        await self.bot.config.reload()
+        await interaction.followup.send(f"✅ 経済統計の対象を **{role.name}** を持つメンバーに限定しました。", ephemeral=True)
+    # ▼▼▼ 追加: 経済統計の「アクティブ判定期間」を設定 ▼▼▼
+    @app_commands.command(name="config_active_days", description="【最高神】経済統計に含める「アクティブ期間（日数）」を設定します")
+    @app_commands.describe(days="この日数以内に取引がない人は、市民ロールを持っていても計算から除外されます（推奨: 30）")
+    @has_permission("SUPREME_GOD")
+    async def config_active_days(self, interaction: discord.Interaction, days: int):
+        await interaction.response.defer(ephemeral=True)
+        if days < 1:
+            return await interaction.followup.send("❌ 1日以上を設定してください。", ephemeral=True)
+            
+        async with self.bot.get_db() as db:
+            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES ('active_threshold_days', ?)", (str(days),))
+            await db.commit()
+        await self.bot.config.reload()
+        await interaction.followup.send(f"✅ 過去 **{days}日間** に取引がないメンバーを、経済統計から除外するように設定しました。", ephemeral=True)
+
 
 # --- Bot 本体 ---
 class LumenBankBot(commands.Bot):
