@@ -741,9 +741,132 @@ class Salary(commands.Cog):
         except Exception as e:
             logger.error(f"Salary Error: {e}")
             await interaction.followup.send(f"❌ エラーが発生しました: {e}", ephemeral=True)
+# --- Cog: Salary (給与) ---
+class Salary(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    # ▼▼▼ 修正: コマンド名を「一括給与」に変更 & エラー対策済み ▼▼▼
+    @app_commands.command(name="一括給与", description="【最高神】一括給与支給")
+    @has_permission("SUPREME_GOD")
+    async def distribute_all(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        
+        now = datetime.datetime.now()
+        month_tag = now.strftime("%Y-%m")
+        batch_id = str(uuid.uuid4())[:8]
+        
+        # ★エラー対策: 設定ファイルではなく、DBから直接数値を読み込む
+        wage_dict = {}
+        async with self.bot.get_db() as db:
+            async with db.execute("SELECT role_id, amount FROM role_wages") as cursor:
+                rows = await cursor.fetchall()
+                for row in rows:
+                    # IDを強制的に整数(int)にする
+                    wage_dict[int(row['role_id'])] = int(row['amount'])
+
+        if not wage_dict:
+            return await interaction.followup.send("⚠️ 給与設定が見つかりません。先に `/config_set_wage` で役職ごとの給与を設定してください。")
+        
+        # 集計用
+        count = 0
+        total_amount = 0
+        role_breakdown = {} 
+        
+        account_updates = []
+        transaction_records = []
+
+        try:
+            # メンバーリストを取得
+            members = interaction.guild.members if interaction.guild.chunked else [m async for m in interaction.guild.fetch_members()]
+
+            for member in members:
+                if member.bot: continue
+                
+                # 給与対象のロールを持っているかチェック
+                matching_wages = []
+                for r in member.roles:
+                    # r.id(int) と wage_dictのキー(int) で確実に比較
+                    if r.id in wage_dict:
+                        matching_wages.append((wage_dict[r.id], r))
+                
+                if not matching_wages: continue
+                
+                # 一番高い給与のロールを採用
+                wage, role = max(matching_wages, key=lambda x: x[0])
+                
+                account_updates.append((member.id, wage, wage))
+                transaction_records.append((0, member.id, wage, 'SALARY', batch_id, month_tag, f"{month_tag} 給与"))
+                
+                count += 1
+                total_amount += wage
+                
+                if role.name not in role_breakdown:
+                    role_breakdown[role.name] = {"count": 0, "amount": 0, "mention": role.mention}
+                role_breakdown[role.name]["count"] += 1
+                role_breakdown[role.name]["amount"] += wage
+
+            if not account_updates:
+                debug_roles = ", ".join([str(rid) for rid in wage_dict.keys()])
+                return await interaction.followup.send(f"❌ 対象となる役職を持つメンバーがいませんでした。\n(設定中のロールID: `{debug_roles}`)")
+
+            # データベース処理
+            async with self.bot.get_db() as db:
+                try:
+                    await db.execute("INSERT OR IGNORE INTO accounts (user_id, balance, total_earned) VALUES (0, 0, 0)")
+                    
+                    await db.executemany("""
+                        INSERT INTO accounts (user_id, balance, total_earned) VALUES (?, ?, ?)
+                        ON CONFLICT(user_id) DO UPDATE SET 
+                        balance = balance + excluded.balance,
+                        total_earned = total_earned + excluded.total_earned
+                    """, account_updates)
+                    
+                    await db.executemany("""
+                        INSERT INTO transactions (sender_id, receiver_id, amount, type, batch_id, month_tag, description)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, transaction_records)
+                    
+                    await db.commit()
+                    
+                except Exception as db_err:
+                    await db.rollback()
+                    raise db_err
+
+            # 実行者への報告
+            await interaction.followup.send(f"💰 **一括支給完了** (ID: `{batch_id}`)\n人数: {count}名 / 総額: {total_amount:,} L")
+
+            # ログ出力
+            log_ch_id = None
+            async with self.bot.get_db() as db:
+                async with db.execute("SELECT value FROM server_config WHERE key = 'salary_log_id'") as c:
+                    row = await c.fetchone()
+                    if row: log_ch_id = int(row['value'])
+
+            if log_ch_id:
+                channel = self.bot.get_channel(log_ch_id)
+                if channel:
+                    embed = discord.Embed(title="給与一斉送信", description="給与一斉送信が実行されました。", color=0xFFD700, timestamp=now)
+                    embed.add_field(name="実行者", value=interaction.user.mention, inline=False)
+                    embed.add_field(name="合計支給", value=f"**{total_amount:,} Ru**", inline=False)
+                    embed.add_field(name="対象人数", value=f"{count} 人", inline=False)
+                    
+                    breakdown_text = ""
+                    for r_name, data in role_breakdown.items():
+                        breakdown_text += f"✅ {data['mention']}\n金額: {data['amount']:,} Ru / 人数: {data['count']}名\n"
+                    
+                    if breakdown_text:
+                        embed.add_field(name="ロール別内訳", value=breakdown_text, inline=False)
+                    
+                    embed.set_footer(text=f"BatchID: {batch_id}")
+                    await channel.send(embed=embed)
+            
+        except Exception as e:
+            logger.error(f"Salary Error: {e}")
+            await interaction.followup.send(f"❌ エラーが発生しました: {e}", ephemeral=True)
 
 
-    # ▼▼▼ 修正版: ロールバック（ログ出力対応） ▼▼▼
+    # ▼▼▼ ロールバック（変更なし） ▼▼▼
     @app_commands.command(name="salary_rollback", description="【最高神】指定した識別ID(Batch ID)の給与支給を取り消します")
     @app_commands.describe(batch_id="取り消したい支給の識別ID（支給完了時に表示されます）")
     @has_permission("SUPREME_GOD")
@@ -752,7 +875,6 @@ class Salary(commands.Cog):
         
         try:
             async with self.bot.get_db() as db:
-                # データ検索
                 async with db.execute("SELECT receiver_id, amount FROM transactions WHERE batch_id = ? AND type = 'SALARY'", (batch_id,)) as cursor:
                     rows = await cursor.fetchall()
                 
@@ -763,7 +885,6 @@ class Salary(commands.Cog):
                 total_reverted = 0
                 
                 try:
-                    # 1. 回収
                     for row in rows:
                         uid = row['receiver_id']
                         amt = row['amount']
@@ -771,19 +892,15 @@ class Salary(commands.Cog):
                         count += 1
                         total_reverted += amt
                     
-                    # 2. 履歴削除
                     await db.execute("DELETE FROM transactions WHERE batch_id = ?", (batch_id,))
-                    
                     await db.commit()
                     
                 except Exception as db_err:
                     await db.rollback()
                     raise db_err
 
-            # 完了報告
             await interaction.followup.send(f"↩️ **ロールバック完了**\n識別ID `{batch_id}` の支給を取り消しました。\n回収額: {total_reverted:,} L", ephemeral=True)
 
-            # ★追加：ロールバックもログに残す
             log_ch_id = None
             async with self.bot.get_db() as db:
                 async with db.execute("SELECT value FROM server_config WHERE key = 'salary_log_id'") as c:
