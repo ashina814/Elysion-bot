@@ -437,24 +437,117 @@ class PrivateVCManager(commands.Cog):
         # 完了通知 (defer済みなので followup)
         await interaction.followup.send("✅ 設定を保存し、パネルを設置しました。", ephemeral=True)
 
+# --- 送金確認用のボタン ---
+class TransferConfirmView(discord.ui.View):
+    def __init__(self, bot, sender, receiver, amount):
+        super().__init__(timeout=60)
+        self.bot = bot
+        self.sender = sender
+        self.receiver = receiver
+        self.amount = amount
+        self.processed = False
+
+    @discord.ui.button(label="✅ 送金する", style=discord.ButtonStyle.green)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.processed: return
+        self.processed = True
+        
+        # ボタンを押した後の処理（ローディング表示）
+        await interaction.response.defer(ephemeral=True)
+        
+        sender_new_bal = 0
+        receiver_new_bal = 0
+        month_tag = datetime.datetime.now().strftime("%Y-%m")
+
+        try:
+            async with self.bot.get_db() as db:
+                try:
+                    # 1. 残高を減らす
+                    await db.execute("INSERT OR IGNORE INTO accounts (user_id, balance) VALUES (?, 0)", (self.sender.id,))
+                    cursor = await db.execute(
+                        "UPDATE accounts SET balance = balance - ? WHERE user_id = ? AND balance >= ?", 
+                        (self.amount, self.sender.id, self.amount)
+                    )
+                    
+                    if cursor.rowcount == 0:
+                        return await interaction.followup.send(f"❌ 残高が足りません。", ephemeral=True)
+
+                    # 2. 残高を増やす
+                    await db.execute("INSERT OR IGNORE INTO accounts (user_id, balance) VALUES (?, 0)", (self.receiver.id,))
+                    await db.execute("UPDATE accounts SET balance = balance + ? WHERE user_id = ?", (self.amount, self.receiver.id))
+                    
+                    # 3. 履歴保存
+                    await db.execute(
+                        "INSERT INTO transactions (sender_id, receiver_id, amount, type, description, month_tag) VALUES (?, ?, ?, 'TRANSFER', ?, ?)",
+                        (self.sender.id, self.receiver.id, self.amount, f"{self.sender.display_name}からの送金", month_tag)
+                    )
+                    
+                    # ログ用データ取得
+                    async with db.execute("SELECT balance FROM accounts WHERE user_id = ?", (self.sender.id,)) as c:
+                        sender_new_bal = (await c.fetchone())['balance']
+                    async with db.execute("SELECT balance FROM accounts WHERE user_id = ?", (self.receiver.id,)) as c:
+                        receiver_new_bal = (await c.fetchone())['balance']
+
+                    await db.commit()
+
+                except Exception as db_err:
+                    await db.rollback()
+                    raise db_err
+
+            # 完了メッセージ（ボタンを無効化して更新）
+            await interaction.edit_original_response(content=f"✅ 送金成功: {self.receiver.mention} へ {self.amount:,} L 送りました。", embed=None, view=None)
+            
+            # ログ出力
+            log_ch_id = None
+            async with self.bot.get_db() as db:
+                async with db.execute("SELECT value FROM server_config WHERE key = 'currency_log_id'") as c:
+                    row = await c.fetchone()
+                    if row: log_ch_id = int(row['value'])
+            
+            if log_ch_id:
+                channel = self.bot.get_channel(log_ch_id)
+                if channel:
+                    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC+09:00")
+                    embed = discord.Embed(title="送金ログ", color=0xFFD700, timestamp=datetime.datetime.now())
+                    embed.set_author(name="ElysionBOT", icon_url=self.bot.user.display_avatar.url)
+                    embed.description = f"{self.sender.mention} から {self.receiver.mention} へ **{self.amount:,} Ru** 送金されました。"
+                    embed.add_field(name="メモ", value="なし", inline=False)
+                    embed.add_field(
+                        name="残高", 
+                        value=f"送金者: {sender_new_bal:,} Ru\n受取者: {receiver_new_bal:,} Ru", 
+                        inline=False
+                    )
+                    embed.add_field(name="実行時刻", value=now_str, inline=False)
+                    await channel.send(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Transfer Error: {e}")
+            await interaction.followup.send("❌ エラーが発生しました。", ephemeral=True)
+
+    @discord.ui.button(label="❌ キャンセル", style=discord.ButtonStyle.grey)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.processed = True
+        await interaction.response.edit_message(content="❌ 送金をキャンセルしました。", embed=None, view=None)
+
+
 # --- Cog: Economy (残高・送金) ---
 class Economy(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(name="ping", description="Botの応答速度を確認します")
+    @app_commands.command(name="ping", description="【管理者】Botの応答速度を確認します")
+    @has_permission("ADMIN")
     async def ping(self, interaction: discord.Interaction):
         latency = round(self.bot.latency * 1000)
-        await interaction.response.send_message(f"🏓 Pong! Latency: `{latency}ms`")
+        await interaction.response.send_message(f"🏓 Pong! Latency: `{latency}ms`", ephemeral=True)
 
     @app_commands.command(name="balance", description="残高を確認します")
     async def balance(self, interaction: discord.Interaction, member: Optional[discord.Member] = None):
         await interaction.response.defer(ephemeral=True)
 
-        # ターゲット決定
         target = member or interaction.user
         
-        # 権限チェック (自分以外を見る場合)
+        # 他人の口座を見る場合のみ権限チェック
         if target.id != interaction.user.id:
             has_perm = False
             if await self.bot.is_owner(interaction.user):
@@ -466,119 +559,45 @@ class Economy(commands.Cog):
                     if r_id in admin_roles and admin_roles[r_id] in ["SUPREME_GOD", "GODDESS"]:
                         has_perm = True
                         break
-            
             if not has_perm:
                 return await interaction.followup.send("❌ 他人の口座を参照する権限がありません。", ephemeral=True)
 
-        # データ取得
         async with self.bot.get_db() as db:
-            async with db.execute(
-                "SELECT balance, total_earned FROM accounts WHERE user_id = ?", (target.id,)
-            ) as cursor:
+            # ★修正: total_earned は取得しなくてOK
+            async with db.execute("SELECT balance FROM accounts WHERE user_id = ?", (target.id,)) as cursor:
                 row = await cursor.fetchone()
                 bal = row['balance'] if row else 0
-                earned = row['total_earned'] if row else 0
         
-        # デザイン
-        embed = discord.Embed(
-            title="🏛 ルーメン口座照会",
-            color=0xFFD700 # Gold
-        )
+        embed = discord.Embed(title="🏛 ルーメン口座照会", color=0xFFD700)
         embed.set_author(name=f"{target.display_name} 様の口座情報", icon_url=target.display_avatar.url)
         embed.add_field(name="💰 現在の残高", value=f"**{bal:,}** L", inline=False)
-        embed.add_field(name="📈 累計獲得額", value=f"{earned:,} L", inline=False)
+        # ★修正: 累計獲得額の表示を削除しました
         
-        date_str = datetime.datetime.now().strftime("%Y/%m/%d")
-        embed.set_footer(text=f"Server: {interaction.guild.name} | {date_str}")
+        embed.set_footer(text=f"Server: {interaction.guild.name}")
         embed.set_thumbnail(url=target.display_avatar.url)
         
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="transfer", description="送金処理（DM通知付き）")
+    @app_commands.command(name="transfer", description="送金処理（確認あり）")
     async def transfer(self, interaction: discord.Interaction, receiver: discord.Member, amount: int):
-        await interaction.response.defer(ephemeral=True) 
+        # まずは基本的なチェックだけして、確認ボタンを出す
+        if amount <= 0: return await interaction.response.send_message("❌ 1 Ru 以上を指定してください。", ephemeral=True)
+        if amount > 10000000: return await interaction.response.send_message("❌ 1回の送金上限は 10,000,000 Ru です。", ephemeral=True)
+        if receiver.id == interaction.user.id: return await interaction.response.send_message("❌ 自分自身には送金できません。", ephemeral=True)
+        if receiver.bot: return await interaction.response.send_message("❌ Botには送金できません。", ephemeral=True)
+
+        # 確認Embedを作成
+        embed = discord.Embed(title="⚠️ 送金確認", description="以下の内容で送金しますか？", color=discord.Color.orange())
+        embed.add_field(name="送金先", value=receiver.mention, inline=False)
+        embed.add_field(name="金額", value=f"**{amount:,} L**", inline=False)
         
-        # 1. 入力値の安全性チェック
-        if amount <= 0:
-            return await interaction.followup.send("❌ 1 Ru 以上を指定してください。", ephemeral=True)
-        if amount > 10000000: # 上限設定（例: 1000万）
-            return await interaction.followup.send("❌ 1回の送金上限は 10,000,000 Ru です。", ephemeral=True)
-            
-        if receiver.id == interaction.user.id:
-            return await interaction.followup.send("❌ 自分自身には送金できません。", ephemeral=True)
-        if receiver.bot:
-            return await interaction.followup.send("❌ Botには送金できません。", ephemeral=True)
-
-        sender = interaction.user
-        month_tag = datetime.datetime.now().strftime("%Y-%m")
-
-        try:
-            async with self.bot.get_db() as db:
-                # ★修正: begin() を削除し、try-except ブロックに変更
-                try:
-                    # 送信者の口座を作成（無い場合）
-                    await db.execute("INSERT OR IGNORE INTO accounts (user_id, balance) VALUES (?, 0)", (sender.id,))
-                    
-                    # 残高を減らす（残高不足なら更新件数が0になる）
-                    cursor = await db.execute(
-                        "UPDATE accounts SET balance = balance - ? WHERE user_id = ? AND balance >= ?", 
-                        (amount, sender.id, amount)
-                    )
-                    
-                    # 更新された行数が0なら「残高不足」
-                    if cursor.rowcount == 0:
-                        async with db.execute("SELECT balance FROM accounts WHERE user_id = ?", (sender.id,)) as c:
-                            row = await c.fetchone()
-                            curr = row['balance'] if row else 0
-                        # ここでロールバックする必要はないが、処理を中断
-                        return await interaction.followup.send(f"❌ 残高が足りません。\n(送金額: {amount:,} L / 現在: {curr:,} L)", ephemeral=True)
-
-                    # 相手の口座を作成 & 振り込む
-                    await db.execute("INSERT OR IGNORE INTO accounts (user_id, balance) VALUES (?, 0)", (receiver.id,))
-                    await db.execute("UPDATE accounts SET balance = balance + ? WHERE user_id = ?", (amount, receiver.id))
-                    
-                    # 履歴保存
-                    await db.execute(
-                        "INSERT INTO transactions (sender_id, receiver_id, amount, type, description, month_tag) VALUES (?, ?, ?, 'TRANSFER', ?, ?)",
-                        (sender.id, receiver.id, amount, f"{sender.display_name}からの送金", month_tag)
-                    )
-                    
-                    # ★ここで確定（コミット）
-                    await db.commit()
-
-                except Exception as db_err:
-                    # DB操作中にエラーが出たら取り消す
-                    await db.rollback()
-                    raise db_err
-
-            # --- 成功後の処理 ---
-
-            # DM通知
-            dm_status = ""
-            try:
-                embed = discord.Embed(
-                    title="💰 送金を受け取りました",
-                    description=f"**{interaction.guild.name}** であなたに送金がありました。",
-                    color=discord.Color.green()
-                )
-                embed.add_field(name="差出人", value=sender.display_name)
-                embed.add_field(name="金額", value=f"{amount:,} L")
-                embed.set_footer(text="Lumen Bank System")
-                await receiver.send(embed=embed)
-            except:
-                dm_status = "（相手の設定によりDM未送信）"
-
-            await interaction.followup.send(f"✅ 送金成功: {receiver.mention} へ {amount:,} L 送りました。{dm_status}", ephemeral=True)
-            
-
-        except Exception as e:
-            logger.error(f"Transfer Error: {e}")
-            await interaction.followup.send("❌ エラーが発生しました。管理者に連絡してください。", ephemeral=True)
-
+        # ボタン付きViewを作成して送信
+        view = TransferConfirmView(self.bot, interaction.user, receiver, amount)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     @app_commands.command(name="history", description="直近の全ての入出金履歴を表示します")
     async def history(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True) # 自分のみ
+        await interaction.response.defer(ephemeral=True)
         async with self.bot.get_db() as db:
             query = "SELECT * FROM transactions WHERE sender_id = ? OR receiver_id = ? ORDER BY created_at DESC LIMIT 10"
             async with db.execute(query, (interaction.user.id, interaction.user.id)) as cursor:
@@ -592,9 +611,8 @@ class Economy(commands.Cog):
             emoji = "📤 送金" if is_sender else "📥 受取"
             amount_str = f"{'-' if is_sender else '+'}{r['amount']:,} L"
             
-            # 相手の名前解決
             if r['sender_id'] == 0 or r['receiver_id'] == 0:
-                target_name = "システム (Fee/Reward)"
+                target_name = "システム"
             else:
                 target_id = r['receiver_id'] if is_sender else r['sender_id']
                 target_name = f"<@{target_id}>"
@@ -606,26 +624,30 @@ class Economy(commands.Cog):
             )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-
 # --- Cog: Salary (給与) ---
 class Salary(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    # ▼▼▼ 修正版: 一括給与支給コマンド ▼▼▼
+    # ▼▼▼ 修正版: 一括給与支給（詳細ログ対応） ▼▼▼
     @app_commands.command(name="salary_distribute_all", description="【最高神】一括給与支給")
     @has_permission("SUPREME_GOD")
     async def distribute_all(self, interaction: discord.Interaction):
         await interaction.response.defer()
+        
         now = datetime.datetime.now()
         month_tag = now.strftime("%Y-%m")
-        # 識別ID（ロールバック用）を生成
         batch_id = str(uuid.uuid4())[:8]
         
         wage_dict = self.bot.config.role_wages 
         
-        count, total_amount = 0, 0
-        account_updates, transaction_records = [], []
+        # 集計用変数
+        count = 0
+        total_amount = 0
+        role_breakdown = {} # { "ロール名": { "count": 0, "amount": 0, "mention": "@Role" } }
+        
+        account_updates = []
+        transaction_records = []
 
         try:
             # メンバーリストを取得
@@ -633,29 +655,41 @@ class Salary(commands.Cog):
 
             for member in members:
                 if member.bot: continue
-                # 設定された役職を持っているかチェック
-                matching_wages = [wage_dict[r.id] for r in member.roles if r.id in wage_dict]
+                
+                # 給与対象のロールを持っているかチェック
+                matching_wages = []
+                for r in member.roles:
+                    if r.id in wage_dict:
+                        matching_wages.append((wage_dict[r.id], r))
+                
                 if not matching_wages: continue
                 
-                # 一番高い給与を採用
-                wage = max(matching_wages)
+                # 一番高い給与のロールを採用
+                wage, role = max(matching_wages, key=lambda x: x[0])
                 
-                # DB更新用データを作成
+                # DB更新用データ
                 account_updates.append((member.id, wage, wage))
                 transaction_records.append((0, member.id, wage, 'SALARY', batch_id, month_tag, f"{month_tag} 給与"))
+                
+                # 統計データ更新
                 count += 1
                 total_amount += wage
+                
+                if role.name not in role_breakdown:
+                    role_breakdown[role.name] = {"count": 0, "amount": 0, "mention": role.mention}
+                role_breakdown[role.name]["count"] += 1
+                role_breakdown[role.name]["amount"] += wage
 
             if not account_updates:
                 return await interaction.followup.send("対象となる役職を持つメンバーがいませんでした。")
 
-            # データベース処理（安全装置付き）
+            # データベース処理
             async with self.bot.get_db() as db:
                 try:
-                    # 1. まずシステム口座（ID:0）を確実に作る（エラー回避）
+                    # 1. システム口座確保
                     await db.execute("INSERT OR IGNORE INTO accounts (user_id, balance, total_earned) VALUES (0, 0, 0)")
                     
-                    # 2. 全員の残高を更新
+                    # 2. 残高更新
                     await db.executemany("""
                         INSERT INTO accounts (user_id, balance, total_earned) VALUES (?, ?, ?)
                         ON CONFLICT(user_id) DO UPDATE SET 
@@ -663,28 +697,53 @@ class Salary(commands.Cog):
                         total_earned = total_earned + excluded.total_earned
                     """, account_updates)
                     
-                    # 3. 取引履歴を記録
+                    # 3. 履歴記録
                     await db.executemany("""
                         INSERT INTO transactions (sender_id, receiver_id, amount, type, batch_id, month_tag, description)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                     """, transaction_records)
                     
-                    # 4. ここまでエラーがなければ確定（セーブ）
                     await db.commit()
                     
                 except Exception as db_err:
-                    # 途中でエラーが起きたら、変更を全部なかったことにする（ロールバック）
                     await db.rollback()
                     raise db_err
 
-            await interaction.followup.send(f"💰 **一括支給完了**\n対象: {count}名\n総額: {total_amount:,} L\n識別ID: `{batch_id}`\n(※万が一間違えた場合は `/salary_rollback {batch_id}` で取り消せます)")
+            # 実行者への簡易報告
+            await interaction.followup.send(f"💰 **一括支給完了** (ID: `{batch_id}`)\n人数: {count}名 / 総額: {total_amount:,} L")
+
+            # ★ここが追加部分：給与ログ出力（詳細レポート）
+            log_ch_id = None
+            async with self.bot.get_db() as db:
+                async with db.execute("SELECT value FROM server_config WHERE key = 'salary_log_id'") as c:
+                    row = await c.fetchone()
+                    if row: log_ch_id = int(row['value'])
+
+            if log_ch_id:
+                channel = self.bot.get_channel(log_ch_id)
+                if channel:
+                    embed = discord.Embed(title="給与一斉送信", description="給与一斉送信が実行されました。", color=0xFFD700, timestamp=now)
+                    embed.add_field(name="実行者", value=interaction.user.mention, inline=False)
+                    embed.add_field(name="合計支給", value=f"**{total_amount:,} Ru**", inline=False)
+                    embed.add_field(name="対象人数", value=f"{count} 人", inline=False)
+                    
+                    # ロール別内訳を表示
+                    breakdown_text = ""
+                    for r_name, data in role_breakdown.items():
+                        breakdown_text += f"✅ {data['mention']}\n金額: {data['amount']:,} Ru / 人数: {data['count']}名\n"
+                    
+                    if breakdown_text:
+                        embed.add_field(name="ロール別内訳", value=breakdown_text, inline=False)
+                    
+                    embed.set_footer(text=f"BatchID: {batch_id}")
+                    await channel.send(embed=embed)
             
         except Exception as e:
             logger.error(f"Salary Error: {e}")
-            await interaction.followup.send(f"❌ 支給中にエラーが発生しました: {e}", ephemeral=True)
+            await interaction.followup.send(f"❌ エラーが発生しました: {e}", ephemeral=True)
 
 
-    # ▼▼▼ 追加機能: 給与取り消し（ロールバック）コマンド ▼▼▼
+    # ▼▼▼ 修正版: ロールバック（ログ出力対応） ▼▼▼
     @app_commands.command(name="salary_rollback", description="【最高神】指定した識別ID(Batch ID)の給与支給を取り消します")
     @app_commands.describe(batch_id="取り消したい支給の識別ID（支給完了時に表示されます）")
     @has_permission("SUPREME_GOD")
@@ -693,7 +752,7 @@ class Salary(commands.Cog):
         
         try:
             async with self.bot.get_db() as db:
-                # 指定されたIDの給与データを検索
+                # データ検索
                 async with db.execute("SELECT receiver_id, amount FROM transactions WHERE batch_id = ? AND type = 'SALARY'", (batch_id,)) as cursor:
                     rows = await cursor.fetchall()
                 
@@ -704,19 +763,17 @@ class Salary(commands.Cog):
                 total_reverted = 0
                 
                 try:
-                    # 1. 配ったお金を各ユーザーから回収する
+                    # 1. 回収
                     for row in rows:
                         uid = row['receiver_id']
                         amt = row['amount']
-                        # 残高と累計獲得額の両方から引く
                         await db.execute("UPDATE accounts SET balance = balance - ?, total_earned = total_earned - ? WHERE user_id = ?", (amt, amt, uid))
                         count += 1
                         total_reverted += amt
                     
-                    # 2. 取引履歴を削除する（なかったことにする）
+                    # 2. 履歴削除
                     await db.execute("DELETE FROM transactions WHERE batch_id = ?", (batch_id,))
                     
-                    # 3. 確定
                     await db.commit()
                     
                 except Exception as db_err:
@@ -724,11 +781,28 @@ class Salary(commands.Cog):
                     raise db_err
 
             # 完了報告
-            await interaction.followup.send(f"↩️ **ロールバック完了**\n識別ID `{batch_id}` の支給を取り消しました。\n対象: {count}件\n回収額: {total_reverted:,} L", ephemeral=True)
+            await interaction.followup.send(f"↩️ **ロールバック完了**\n識別ID `{batch_id}` の支給を取り消しました。\n回収額: {total_reverted:,} L", ephemeral=True)
+
+            # ★追加：ロールバックもログに残す
+            log_ch_id = None
+            async with self.bot.get_db() as db:
+                async with db.execute("SELECT value FROM server_config WHERE key = 'salary_log_id'") as c:
+                    row = await c.fetchone()
+                    if row: log_ch_id = int(row['value'])
+            
+            if log_ch_id:
+                channel = self.bot.get_channel(log_ch_id)
+                if channel:
+                    embed = discord.Embed(title="⚠️ 給与ロールバック実行", description=f"以下の給与支給が取り消されました。", color=discord.Color.red(), timestamp=datetime.datetime.now())
+                    embed.add_field(name="実行者", value=interaction.user.mention, inline=False)
+                    embed.add_field(name="対象BatchID", value=f"`{batch_id}`", inline=False)
+                    embed.add_field(name="回収総額", value=f"-{total_reverted:,} Ru", inline=False)
+                    embed.add_field(name="対象人数", value=f"{count} 名", inline=False)
+                    await channel.send(embed=embed)
 
         except Exception as e:
             logger.error(f"Rollback Error: {e}")
-            await interaction.followup.send(f"❌ ロールバック中にエラーが発生しました: {e}", ephemeral=True)
+            await interaction.followup.send(f"❌ エラーが発生しました: {e}", ephemeral=True)
 
 # --- Cog: VoiceSystem  ---
 class VoiceSystem(commands.Cog):
@@ -912,7 +986,7 @@ class InterviewSystem(commands.Cog):
                     exclude_role_id = int(row['value'])
 
         targets = []
-        skipped_members = [] # 除外された人のリスト
+        skipped_names = [] # 除外された人の名前リスト
 
         # 2. 対象者の決定ロジック
         if target:
@@ -927,7 +1001,7 @@ class InterviewSystem(commands.Cog):
                 for m in raw_members:
                     # 除外ロールを持っているか確認
                     if exclude_role_id and any(r.id == exclude_role_id for r in m.roles):
-                        skipped_members.append(m.display_name)
+                        skipped_names.append(m.display_name)
                         continue
                     targets.append(m)
 
@@ -937,19 +1011,18 @@ class InterviewSystem(commands.Cog):
 
         if not targets:
             msg = "❌ 対象となるメンバーがいませんでした。"
-            if skipped_members:
-                msg += f"\n(除外されたメンバー: {', '.join(skipped_members)})"
+            if skipped_names:
+                msg += f"\n(除外されたメンバー: {', '.join(skipped_names)})"
             return await interaction.followup.send(msg, ephemeral=True)
 
         # 3. 一括処理実行
-        success_count = 0
+        success_members = [] # 成功したメンバーオブジェクトを保存
         error_logs = []
         month_tag = datetime.datetime.now().strftime("%Y-%m")
 
         async with self.bot.get_db() as db:
-            # ★修正: db.begin() を削除し、手動管理へ
             try:
-                # 0. システム口座(ID:0)を確実に作る（エラー回避）
+                # 0. システム口座(ID:0)を確実に作る
                 await db.execute("INSERT OR IGNORE INTO accounts (user_id, balance, total_earned) VALUES (0, 0, 0)")
 
                 for member in targets:
@@ -961,10 +1034,7 @@ class InterviewSystem(commands.Cog):
                             await member.add_roles(role, reason="面接通過コマンドによる付与")
                         
                         # B. お金付与
-                        # 口座がなければ作る
                         await db.execute("INSERT OR IGNORE INTO accounts (user_id, balance) VALUES (?, 0)", (member.id,))
-                        
-                        # 残高追加
                         await db.execute(
                             "UPDATE accounts SET balance = balance + ?, total_earned = total_earned + ? WHERE user_id = ?", 
                             (amount, amount, member.id)
@@ -976,7 +1046,7 @@ class InterviewSystem(commands.Cog):
                             (member.id, amount, f"面接通過祝い: {role.name}", month_tag)
                         )
                         
-                        success_count += 1
+                        success_members.append(member) # 成功リストに追加
                         
                     except discord.Forbidden:
                         error_logs.append(f"⚠️ {member.display_name}: 権限不足でロールを付与できませんでした")
@@ -984,7 +1054,7 @@ class InterviewSystem(commands.Cog):
                         error_logs.append(f"❌ {member.display_name}: エラーが発生しました ({e})")
                         logger.error(f"Interview Command Error [{member.id}]: {e}")
                 
-                # ★最後にコミット（これで確定）
+                # ★最後にコミット
                 await db.commit()
 
             except Exception as db_err:
@@ -992,23 +1062,54 @@ class InterviewSystem(commands.Cog):
                 logger.error(f"Interview Transaction Error: {db_err}")
                 return await interaction.followup.send("❌ データベースエラーが発生しました。", ephemeral=True)
 
-        # 4. 結果報告Embed
+        # 4. コマンド実行者への結果報告
         embed = discord.Embed(title="🌸 面接通過処理完了", color=discord.Color.pink())
         embed.add_field(name="対象範囲", value=mode_text, inline=False)
         embed.add_field(name="付与ロール", value=role.mention, inline=True)
         embed.add_field(name="支給額", value=f"{amount:,} L", inline=True)
         
-        # 結果の内訳
-        result_text = f"✅ 成功: {success_count}名"
-        if skipped_members:
-            result_text += f"\n⛔ 除外(説明者): {len(skipped_members)}名"
+        result_text = f"✅ 成功: {len(success_members)}名"
+        if skipped_names:
+            result_text += f"\n⛔ 除外(説明者): {len(skipped_names)}名"
             
         embed.add_field(name="処理結果", value=result_text, inline=False)
-        
         if error_logs:
             embed.add_field(name="エラーログ", value="\n".join(error_logs[:5]), inline=False)
 
         await interaction.followup.send(embed=embed)
+
+        # 5. ★追加部分：専用ログチャンネルへの出力
+        log_ch_id = None
+        async with self.bot.get_db() as db:
+            async with db.execute("SELECT value FROM server_config WHERE key = 'interview_log_id'") as c:
+                row = await c.fetchone()
+                if row: log_ch_id = int(row['value'])
+
+        if log_ch_id:
+            channel = self.bot.get_channel(log_ch_id)
+            if channel:
+                log_embed = discord.Embed(title="面接通過 一括結果", color=0xFFD700, timestamp=datetime.datetime.now())
+                log_embed.add_field(name="実行者", value=interaction.user.mention, inline=False)
+                log_embed.add_field(name="対象数", value=f"{len(targets)}名", inline=True)
+                log_embed.add_field(name="成功", value=f"{len(success_members)}名", inline=True)
+                log_embed.add_field(name="付与ロール", value=role.mention, inline=False)
+                log_embed.add_field(name="付与額", value=f"{amount:,} Ru", inline=False)
+                
+                # 成功者リスト（最大文字数対策で一部のみ表示）
+                success_text = "\n".join([f"・{m.mention} ({m.display_name})" for m in success_members])
+                if len(success_text) > 1000:
+                    success_text = success_text[:950] + "\n...他多数"
+                
+                if success_text:
+                    log_embed.add_field(name="✅ 合格者一覧", value=success_text, inline=False)
+                
+                if skipped_names:
+                    log_embed.add_field(name="⛔ スキップ(説明者等)", value=", ".join(skipped_names), inline=False)
+                
+                if error_logs:
+                    log_embed.add_field(name="⚠️ エラー", value="\n".join(error_logs[:5]), inline=False)
+
+                await channel.send(embed=log_embed)
 
 # --- Cog: ServerStats (サーバー経済統計 & グラフ) ---
 class ServerStats(commands.Cog):
@@ -1084,7 +1185,8 @@ class ServerStats(commands.Cog):
     async def before_daily_log(self):
         await self.bot.wait_until_ready()
 
-    @app_commands.command(name="economy_graph", description="一般市民の総資産推移をグラフ化します")
+    @app_commands.command(name="economy_graph", description="【管理者】一般市民の総資産推移をグラフ化します")
+    @has_permission("ADMIN") # ★ここ！管理者以外は使えないようにロックを追加
     async def economy_graph(self, interaction: discord.Interaction):
         await interaction.response.defer()
         
@@ -1131,24 +1233,37 @@ class AdminTools(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(name="config_set_log_channel", description="【最高神】監査ログ（証拠）の出力先を設定します")
+    # ▼▼▼ 1. ログ出力先設定（3種類対応版） ▼▼▼
+    @app_commands.command(name="config_log_channel", description="各ログの出力先を設定します")
+    @app_commands.choices(log_type=[
+        discord.app_commands.Choice(name="通貨ログ (送金など)", value="currency_log_id"),
+        discord.app_commands.Choice(name="給与ログ (一斉支給)", value="salary_log_id"),
+        discord.app_commands.Choice(name="面接ログ (合格通知)", value="interview_log_id")
+    ])
     @has_permission("SUPREME_GOD")
-    async def set_log_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
-        # タイムアウト対策
+    async def config_log_channel(self, interaction: discord.Interaction, log_type: str, channel: discord.TextChannel):
         await interaction.response.defer(ephemeral=True)
-        
         async with self.bot.get_db() as db:
-            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES ('log_channel_id', ?)", (str(channel.id),))
+            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES (?, ?)", (log_type, str(channel.id)))
             await db.commit()
-        
-        # deferした後は followup.send を使う
-        await interaction.followup.send(f"✅ 以降、全ての重要ログを {channel.mention} に送信します。", ephemeral=True)
+        await self.bot.config.reload()
+        await interaction.followup.send(f"✅ **{channel.mention}** をログ出力先に設定しました。", ephemeral=True)
 
+    # ▼▼▼ 2. 面接の除外ロール設定（★これが抜けてました！） ▼▼▼
+    @app_commands.command(name="config_exclude_role", description="【最高神】面接コマンドでスキップするロール（説明者など）を設定")
+    @has_permission("SUPREME_GOD")
+    async def config_exclude_role(self, interaction: discord.Interaction, role: discord.Role):
+        await interaction.response.defer(ephemeral=True)
+        async with self.bot.get_db() as db:
+            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES ('exclude_role_id', ?)", (str(role.id),))
+            await db.commit()
+        await self.bot.config.reload()
+        await interaction.followup.send(f"✅ 面接時に **{role.name}** を持つメンバーを除外（スキップ）するように設定しました。", ephemeral=True)
+
+    #▼▼▼ 3. 管理者権限設定 ▼▼▼
     @app_commands.command(name="config_set_admin", description="【オーナー用】管理権限ロールを登録・更新します")
     async def config_set_admin(self, interaction: discord.Interaction, role: discord.Role, level: str):
-        # ここも先に待機中にする
         await interaction.response.defer(ephemeral=True)
-
         if not await self.bot.is_owner(interaction.user):
             return await interaction.followup.send("オーナーのみ実行可能です。", ephemeral=True)
         
@@ -1160,68 +1275,53 @@ class AdminTools(commands.Cog):
             await db.execute("INSERT OR REPLACE INTO admin_roles (role_id, perm_level) VALUES (?, ?)", (role.id, level))
             await db.commit()
         await self.bot.config.reload()
-        
         await interaction.followup.send(f"✅ {role.mention} を `{level}` に設定しました。", ephemeral=True)
 
+    # ▼▼▼ 4. 給与額設定 ▼▼▼
     @app_commands.command(name="config_set_wage", description="【最高神】役職ごとの給与額を設定します")
     @has_permission("SUPREME_GOD")
     async def config_set_wage(self, interaction: discord.Interaction, role: discord.Role, amount: int):
-        # ★エラーが出ていた箇所。deferを追加して修正★
         await interaction.response.defer(ephemeral=True)
-        
         async with self.bot.get_db() as db:
             await db.execute("INSERT OR REPLACE INTO role_wages (role_id, amount) VALUES (?, ?)", (role.id, amount))
             await db.commit()
         await self.bot.config.reload()
-        
         await interaction.followup.send(f"✅ 設定を更新しました。", ephemeral=True)
 
+    # ▼▼▼ 5. VC報酬設定エリア ▼▼▼
     @app_commands.command(name="vc_reward_add", description="【最高神】報酬対象のVCを追加します")
     @has_permission("SUPREME_GOD")
     async def add_reward_vc(self, interaction: discord.Interaction, channel: discord.VoiceChannel):
         await interaction.response.defer(ephemeral=True)
-        
         async with self.bot.get_db() as db:
-            # 重複無視で挿入
             await db.execute("INSERT OR IGNORE INTO reward_channels (channel_id) VALUES (?)", (channel.id,))
             await db.commit()
         
-        # VoiceSystemに即座に反映
         vc_cog = self.bot.get_cog("VoiceSystem")
-        if vc_cog:
-            await vc_cog.reload_targets()
-
+        if vc_cog: await vc_cog.reload_targets()
         await interaction.followup.send(f"✅ {channel.mention} を報酬対象に追加しました。", ephemeral=True)
 
     @app_commands.command(name="vc_reward_remove", description="【最高神】報酬対象のVCを解除します")
     @has_permission("SUPREME_GOD")
     async def remove_reward_vc(self, interaction: discord.Interaction, channel: discord.VoiceChannel):
         await interaction.response.defer(ephemeral=True)
-
         async with self.bot.get_db() as db:
             await db.execute("DELETE FROM reward_channels WHERE channel_id = ?", (channel.id,))
             await db.commit()
 
-        # VoiceSystemに即座に反映
         vc_cog = self.bot.get_cog("VoiceSystem")
-        if vc_cog:
-            await vc_cog.reload_targets()
-
+        if vc_cog: await vc_cog.reload_targets()
         await interaction.followup.send(f"🗑️ {channel.mention} を報酬対象から除外しました。", ephemeral=True)
 
     @app_commands.command(name="vc_reward_list", description="【最高神】報酬対象のVC一覧を表示します")
     @has_permission("SUPREME_GOD")
     async def list_reward_vcs(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        
         async with self.bot.get_db() as db:
             async with db.execute("SELECT channel_id FROM reward_channels") as cursor:
                 rows = await cursor.fetchall()
         
-        if not rows:
-            return await interaction.followup.send("報酬対象のVCは設定されていません。", ephemeral=True)
-
-        # チャンネルリンクを作成して表示
+        if not rows: return await interaction.followup.send("報酬対象のVCは設定されていません。", ephemeral=True)
         channels_text = "\n".join([f"• <#{row['channel_id']}>" for row in rows])
         embed = discord.Embed(title="🎙 報酬対象VC一覧", description=channels_text, color=discord.Color.green())
         await interaction.followup.send(embed=embed, ephemeral=True)
