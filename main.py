@@ -387,7 +387,7 @@ class PrivateVCManager(commands.Cog):
     async def before_check(self):
         await self.bot.wait_until_ready()
 
-    @app_commands.command(name="deploy_vc_panel", description="【管理者】内容をカスタマイズしてVC作成パネルを設置します")
+    @app_commands.command(name="一時VCパネル作成", description="【管理者】内容をカスタマイズしてVC作成パネルを設置します")
     @app_commands.describe(
         title="パネルのタイトル",
         description="パネルの説明文（\\nで改行）",
@@ -1223,7 +1223,7 @@ class ServerStats(commands.Cog):
         await self.bot.wait_until_ready()
 
     # --- グラフコマンド ---
-    @app_commands.command(name="economy_graph", description="【管理者】経済状況・インフレ率・格差・活発度を表示")
+    @app_commands.command(name="経済グラフ", description="【管理者】経済状況・インフレ率・格差・活発度を表示")
     @has_permission("ADMIN")
     async def economy_graph(self, interaction: discord.Interaction):
         await interaction.response.defer()
@@ -1334,15 +1334,8 @@ class ServerStats(commands.Cog):
         embed.set_footer(text=footer_text)
 
         await interaction.followup.send(embed=embed, file=file)
-# ==========================================
-# ▼▼▼ ここからショップ機能 (ShopSystem) ▼▼▼
-# ==========================================
 
-# もしメインファイルの上の方にない場合は、これらを追加してください
-# from discord.ext import tasks
-# import datetime
 
-# --- ショップで購入ボタンを押した時の処理 ---
 class ShopPurchaseView(discord.ui.View):
     def __init__(self, bot, role_id, price, shop_id):
         super().__init__(timeout=None)
@@ -1683,7 +1676,7 @@ class AdminTools(commands.Cog):
         if vc_cog: await vc_cog.reload_targets()
         await interaction.followup.send(f"🗑️ {channel.mention} を報酬対象から除外しました。", ephemeral=True)
 
-    @app_commands.command(name="vc_reward_list", description="【最高神】報酬対象のVC一覧を表示します")
+    @app_commands.command(name="vc報酬リスト", description="【最高神】報酬対象のVC一覧を表示します")
     @has_permission("SUPREME_GOD")
     async def list_reward_vcs(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -1706,7 +1699,7 @@ class AdminTools(commands.Cog):
         await self.bot.config.reload()
         await interaction.followup.send(f"✅ 経済統計の対象を **{role.name}** を持つメンバーに限定しました。", ephemeral=True)
     # ▼▼▼ 追加: 経済統計の「アクティブ判定期間」を設定 ▼▼▼
-    @app_commands.command(name="config_active_days", description="【最高神】経済統計に含める「アクティブ期間（日数）」を設定します")
+    @app_commands.command(name="経済集計アクティブ判定期間", description="【最高神】経済統計に含める「アクティブ期間（日数）」を設定します")
     @app_commands.describe(days="この日数以内に取引がない人は、市民ロールを持っていても計算から除外されます（推奨: 30）")
     @has_permission("SUPREME_GOD")
     async def config_active_days(self, interaction: discord.Interaction, days: int):
