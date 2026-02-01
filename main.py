@@ -1334,6 +1334,269 @@ class ServerStats(commands.Cog):
         embed.set_footer(text=footer_text)
 
         await interaction.followup.send(embed=embed, file=file)
+# ==========================================
+# ▼▼▼ ここからショップ機能 (ShopSystem) ▼▼▼
+# ==========================================
+
+# もしメインファイルの上の方にない場合は、これらを追加してください
+# from discord.ext import tasks
+# import datetime
+
+# --- ショップで購入ボタンを押した時の処理 ---
+class ShopPurchaseView(discord.ui.View):
+    def __init__(self, bot, role_id, price, shop_id):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.role_id = role_id
+        self.price = price
+        self.shop_id = shop_id
+
+    @discord.ui.button(label="このロールを購入する (30日間)", style=discord.ButtonStyle.green, emoji="🛒")
+    async def buy_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        
+        user = interaction.user
+        role = interaction.guild.get_role(self.role_id)
+
+        if not role:
+            return await interaction.followup.send("❌ この商品は現在取り扱われていません。", ephemeral=True)
+
+        if role in user.roles:
+            return await interaction.followup.send(f"✅ すでに **{role.name}** を持っています。\n期限切れになってから再度購入してください。", ephemeral=True)
+
+        async with self.bot.get_db() as db:
+            async with db.execute("SELECT balance FROM accounts WHERE user_id = ?", (user.id,)) as cursor:
+                row = await cursor.fetchone()
+                balance = row['balance'] if row else 0
+
+            if balance < self.price:
+                return await interaction.followup.send(f"❌ お金が足りません。\n(価格: {self.price:,} L / 所持金: {balance:,} L)", ephemeral=True)
+
+            try:
+                await db.execute("UPDATE accounts SET balance = balance - ? WHERE user_id = ?", (self.price, user.id))
+                
+                month_tag = datetime.datetime.now().strftime("%Y-%m")
+                await db.execute(
+                    "INSERT INTO transactions (sender_id, receiver_id, amount, type, description, month_tag) VALUES (?, 0, ?, 'SHOP', ?, ?)",
+                    (user.id, self.price, f"購入: {role.name} (Shop: {self.shop_id})", month_tag)
+                )
+
+                expiry_date = datetime.datetime.now() + datetime.timedelta(days=30)
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS shop_subscriptions (
+                        user_id INTEGER,
+                        role_id INTEGER,
+                        expiry_date TEXT,
+                        PRIMARY KEY (user_id, role_id)
+                    )
+                """)
+                await db.execute(
+                    "INSERT OR REPLACE INTO shop_subscriptions (user_id, role_id, expiry_date) VALUES (?, ?, ?)",
+                    (user.id, role.id, expiry_date.strftime("%Y-%m-%d %H:%M:%S"))
+                )
+                
+                await db.commit()
+
+            except Exception as e:
+                await db.rollback()
+                return await interaction.followup.send(f"❌ エラーが発生しました: {e}", ephemeral=True)
+
+        try:
+            await user.add_roles(role, reason=f"ショップ購入({self.shop_id})")
+            expiry_str = expiry_date.strftime('%Y/%m/%d')
+            await interaction.followup.send(f"🎉 **購入完了！**\n**{role.name}** を購入しました。\n有効期限: **{expiry_str}** まで\n(-{self.price:,} L)", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.followup.send("⚠️ 購入処理は完了しましたが、権限不足でロールを付与できませんでした。", ephemeral=True)
+
+
+# --- 商品選択メニュー ---
+class ShopSelect(discord.ui.Select):
+    def __init__(self, bot, items, shop_id):
+        self.bot = bot
+        self.shop_id = shop_id
+        options = []
+        for item in items:
+            role = item['role_obj']
+            price = item['price']
+            desc = item['desc'] or "説明なし"
+            options.append(discord.SelectOption(
+                label=f"{role.name} ({price:,} L)",
+                description=f"[30日] {desc}"[:90], 
+                value=str(role.id),
+                emoji="🏷️"
+            ))
+        super().__init__(placeholder="購入したい商品を選択してください...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        role_id = int(self.values[0])
+        price = 0
+        
+        async with self.bot.get_db() as db:
+            async with db.execute("SELECT price FROM shop_items WHERE role_id = ? AND shop_id = ?", (str(role_id), self.shop_id)) as cursor:
+                row = await cursor.fetchone()
+                if row: price = row['price']
+        
+        view = ShopPurchaseView(self.bot, role_id, price, self.shop_id)
+        role = interaction.guild.get_role(role_id)
+        
+        embed = discord.Embed(title="🛒 購入確認 (30日レンタル)", description=f"以下のロールを購入しますか？", color=role.color)
+        embed.add_field(name="商品名", value=role.mention, inline=False)
+        embed.add_field(name="価格", value=f"**{price:,} L** / 30日間", inline=False)
+        embed.add_field(name="有効期限", value="購入日から30日間（自動解除）", inline=False)
+        
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+class ShopPanelView(discord.ui.View):
+    def __init__(self, bot, items, shop_id):
+        super().__init__(timeout=None)
+        self.add_item(ShopSelect(bot, items, shop_id))
+
+
+# --- Cog本体 ---
+class ShopSystem(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.check_subscription_expiry.start()
+
+    def cog_unload(self):
+        self.check_subscription_expiry.cancel()
+
+    @tasks.loop(hours=1)
+    async def check_subscription_expiry(self):
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        expired_rows = []
+        async with self.bot.get_db() as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS shop_subscriptions (
+                    user_id INTEGER,
+                    role_id INTEGER,
+                    expiry_date TEXT,
+                    PRIMARY KEY (user_id, role_id)
+                )
+            """)
+            async with db.execute("SELECT user_id, role_id FROM shop_subscriptions WHERE expiry_date < ?", (now_str,)) as cursor:
+                expired_rows = await cursor.fetchall()
+        
+        if not expired_rows: return
+
+        guild = self.bot.guilds[0]
+        async with self.bot.get_db() as db:
+            for row in expired_rows:
+                user_id = row['user_id']
+                role_id = row['role_id']
+                member = guild.get_member(user_id)
+                role = guild.get_role(role_id)
+                
+                if member and role:
+                    try:
+                        if role in member.roles:
+                            await member.remove_roles(role, reason="ショップ有効期限切れ")
+                            try:
+                                await member.send(f"⏳ **有効期限切れ**\nロール **{role.name}** の有効期限（30日）が終了しました。")
+                            except: pass
+                    except: pass
+                
+                await db.execute("DELETE FROM shop_subscriptions WHERE user_id = ? AND role_id = ?", (user_id, role_id))
+            await db.commit()
+
+    @check_subscription_expiry.before_loop
+    async def before_check(self):
+        await self.bot.wait_until_ready()
+
+
+    # ▼▼▼ 1. 商品登録 ▼▼▼
+    @app_commands.command(name="ショップ_商品登録", description="【最高神】ショップにロールを出品します")
+    @app_commands.rename(shop_id="ショップid", role="商品ロール", price="価格", description="説明文")
+    @app_commands.describe(
+        shop_id="配置するショップのID（例: main, dark など。好きな英数字）",
+        role="販売するロール",
+        price="30日間の価格 (Lumen)",
+        description="商品の説明文（パネルに表示されます）"
+    )
+    @has_permission("SUPREME_GOD") # ここでメインファイルの has_permission を使います
+    async def shop_add(self, interaction: discord.Interaction, shop_id: str, role: discord.Role, price: int, description: str = None):
+        await interaction.response.defer(ephemeral=True)
+        if price < 0: return await interaction.followup.send("価格は0以上にしてください。", ephemeral=True)
+
+        async with self.bot.get_db() as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS shop_items (
+                    role_id TEXT,
+                    shop_id TEXT,
+                    price INTEGER,
+                    description TEXT,
+                    PRIMARY KEY (role_id, shop_id)
+                )
+            """)
+            await db.execute(
+                "INSERT OR REPLACE INTO shop_items (role_id, shop_id, price, description) VALUES (?, ?, ?, ?)",
+                (str(role.id), shop_id, price, description)
+            )
+            await db.commit()
+            
+        await interaction.followup.send(f"✅ ショップ(`{shop_id}`) に **{role.name}** ({price:,} L) を登録しました。", ephemeral=True)
+
+
+    # ▼▼▼ 2. 商品削除 ▼▼▼
+    @app_commands.command(name="ショップ_商品削除", description="【最高神】ショップから商品を取り下げます")
+    @app_commands.rename(shop_id="ショップid", role="削除ロール")
+    @app_commands.describe(shop_id="削除したい商品があるショップID", role="削除するロール")
+    @has_permission("SUPREME_GOD")
+    async def shop_remove(self, interaction: discord.Interaction, shop_id: str, role: discord.Role):
+        await interaction.response.defer(ephemeral=True)
+        async with self.bot.get_db() as db:
+            await db.execute("DELETE FROM shop_items WHERE role_id = ? AND shop_id = ?", (str(role.id), shop_id))
+            await db.commit()
+        await interaction.followup.send(f"🗑️ ショップ(`{shop_id}`) から **{role.name}** を削除しました。", ephemeral=True)
+
+
+    # ▼▼▼ 3. パネル設置 ▼▼▼
+    @app_commands.command(name="ショップ_パネル設置", description="【最高神】指定したIDのショップパネルを設置します")
+    @app_commands.rename(shop_id="ショップid", title="タイトル", content="本文", image_url="画像url")
+    @app_commands.describe(
+        shop_id="表示するショップID（登録時に決めたもの）", 
+        title="パネルのタイトル", 
+        content="パネルの本文（説明文）", 
+        image_url="画像のURL（あれば）"
+    )
+    @has_permission("SUPREME_GOD")
+    async def shop_panel(self, interaction: discord.Interaction, shop_id: str, title: str = "🛒 ルーメンショップ", content: str = "欲しいロールを選択してください！", image_url: str = None):
+        await interaction.response.defer()
+        
+        items = []
+        async with self.bot.get_db() as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS shop_items (
+                    role_id TEXT,
+                    shop_id TEXT,
+                    price INTEGER,
+                    description TEXT,
+                    PRIMARY KEY (role_id, shop_id)
+                )
+            """)
+            async with db.execute("SELECT * FROM shop_items WHERE shop_id = ?", (shop_id,)) as cursor:
+                rows = await cursor.fetchall()
+                for row in rows:
+                    role = interaction.guild.get_role(int(row['role_id']))
+                    if role:
+                        items.append({'role_obj': role, 'price': row['price'], 'desc': row['description']})
+        
+        if not items:
+            return await interaction.followup.send(f"❌ ショップID `{shop_id}` には商品が登録されていません。\n先に `/ショップ_商品登録` で商品を登録してください。", ephemeral=True)
+
+        embed = discord.Embed(title=title, description=content, color=discord.Color.gold())
+        if image_url: embed.set_image(url=image_url)
+        
+        embed.add_field(name="💳 システム", value="30日間の買い切り制\n(期限が来ると自動解除)", inline=False)
+        
+        item_list_text = ""
+        for item in items:
+            item_list_text += f"• **{item['role_obj'].mention}**: `{item['price']:,} L`\n"
+        embed.add_field(name="📦 商品ラインナップ", value=item_list_text, inline=False)
+
+        view = ShopPanelView(self.bot, items, shop_id)
+        await interaction.followup.send(embed=embed, view=view)
 
 # --- 3. 管理者ツール ---
 class AdminTools(commands.Cog):
@@ -1504,6 +1767,7 @@ class LumenBankBot(commands.Bot):
         await self.add_cog(PrivateVCManager(self))
         await self.add_cog(InterviewSystem(self))
         await self.add_cog(ServerStats(self))
+        await bot.add_cog(ShopSystem(bot))
         self.backup_db_task.start()
         await self.tree.sync()
         logger.info("LumenBank System: Setup complete and Synced.")
