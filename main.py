@@ -623,8 +623,8 @@ class Economy(commands.Cog):
                 inline=False
             )
         await interaction.followup.send(embed=embed, ephemeral=True)
-                    
-class Salary(commands.Cog):
+
+Class Salary(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
@@ -714,8 +714,7 @@ class Salary(commands.Cog):
         await interaction.followup.send(f"💰 **一括支給完了** (BatchID: `{batch_id}`)\n人数: {count}名 / 総額: {total_amount:,} Ru")
 
         await self.send_salary_log(interaction, batch_id, total_amount, count, role_breakdown, now)
-
-    # --- 2. 給与一覧表示コマンド (新規) ---
+# --- 2. 給与一覧表示コマンド (新規) ---
     @app_commands.command(name="給与一覧", description="現在設定されている役職ごとの給与テーブルを表示します")
     async def list_wages(self, interaction: discord.Interaction):
         async with self.bot.get_db() as db:
@@ -768,7 +767,7 @@ class Salary(commands.Cog):
                 return await interaction.followup.send("❌ ロールバック中にエラーが発生しました。")
 
         await interaction.followup.send(f"↩️ **ロールバック完了**\nID: `{batch_id}` の {count}名分 ({total_reverted:,} Ru) を回収しました。")
-
+    
     # --- 共通: ログ送信処理 ---
     async def send_salary_log(self, interaction, batch_id, total, count, breakdown, timestamp):
         log_ch_id = None
@@ -791,6 +790,7 @@ class Salary(commands.Cog):
         
         embed.set_footer(text=f"BatchID: {batch_id}")
         await channel.send(embed=embed)
+
 
 # --- Cog: VoiceSystem  ---
 class VoiceSystem(commands.Cog):
