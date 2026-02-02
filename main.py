@@ -2532,3 +2532,19 @@ class LumenBankBot(commands.Bot):
     async def on_ready(self):
         print(f"Logged in as {self.user} (ID: {self.user.id})")
         print("--- Lumen Bank System Online ---")
+
+# --- 実行ブロック ---
+if __name__ == "__main__":
+    if not TOKEN:
+        # TOKENがない場合のエラーログ
+        logging.error("DISCORD_TOKEN is missing")
+    else:
+        # TOKEN読み込み成功ログ
+        logging.info("DISCORD_TOKEN loaded successfully.")
+        
+        # Keep Alive (必要な場合のみ)
+        # keep_alive.keep_alive() 
+        
+        # ボットの起動
+        bot = LumenBankBot()
+        bot.run(TOKEN)  # ← ★ここが重要！これがないとBotはすぐ終了します
