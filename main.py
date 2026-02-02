@@ -624,7 +624,7 @@ class Economy(commands.Cog):
             )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-Class Salary(commands.Cog):
+class Salary(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
