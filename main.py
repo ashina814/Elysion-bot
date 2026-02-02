@@ -1700,130 +1700,211 @@ class Chinchiro(commands.Cog):
         embed.add_field(name=p2.display_name, value=r2['name'], inline=True)
         await msg.edit(embed=embed, view=None)
 
+# 激アツ絵文字
+GEKIATSU = "<:b_069:1438962326463054008>"
 
 class Slot(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.symbols = ["💎", "7️⃣", "🔔", "🍒", "🃏", "💨"]
-        # 期待値95%調整用
-        self.weights = [30, 50, 120, 250, 60, 490]
-        self.payouts = {"💎": 100, "7️⃣": 50, "🔔": 10, "🍒": 3, "🃏": 10}
+        # 絵柄定義
+        self.SYMBOLS = {
+            "DIAMOND": "💎", # x100
+            "SEVEN":   "7️⃣", # x20
+            "WILD":    "🃏", # x10
+            "BELL":    "🔔", # x5
+            "CHERRY":  "🍒", # x2
+            "MISS":    "💨"  # ハズレ
+        }
         
-        self.paylines = [
-            [(0,0), (0,1), (0,2)], [(1,0), (1,1), (1,2)], [(2,0), (2,1), (2,2)],
-            [(0,0), (1,1), (2,2)], [(2,0), (1,1), (0,2)]
+        # 確率テーブル (合計1000)
+        # RTP(還元率) 約87% = 運営利益 約13%
+        self.PROBABILITY = [
+            ("DIAMOND", 1,   100), # 0.1%  (x100) -> 期待値 0.1
+            ("SEVEN",   4,   20),  # 0.4%  (x20)  -> 期待値 0.08
+            ("WILD",    15,  10),  # 1.5%  (x10)  -> 期待値 0.15
+            ("BELL",    60,  5),   # 6.0%  (x5)   -> 期待値 0.30
+            ("CHERRY",  120, 2),   # 12.0% (x2)   -> 期待値 0.24
+            ("MISS",    800, 0)    # 80.0% (ハズレ)
         ]
+        # 合計期待値 = 0.87 (ユーザーは平均して87%しか戻ってこない＝銀行が勝つ)
 
-    def get_column(self):
-        return random.choices(self.symbols, weights=self.weights, k=3)
+    def determine_outcome(self):
+        """確率テーブルに基づいて結果を先に決定する"""
+        rand = random.randint(1, 1000)
+        current = 0
+        for name, weight, payout in self.PROBABILITY:
+            current += weight
+            if rand <= current:
+                return name, payout
+        return "MISS", 0
 
-    def check_win(self, grid):
-        total_mult = 0
-        best_symbol = None
-        for line_coords in self.paylines:
-            symbols = [grid[r][c] for r, c in line_coords]
-            core = [s for s in symbols if s != "🃏" and s != "💨"]
-            if not core and "💨" not in symbols: match = "🃏"
-            elif len(set(core)) == 1 and "💨" not in symbols: match = core[0]
-            else: continue
-            
-            mult = self.payouts.get(match, 0)
-            total_mult += mult
-            if not best_symbol or mult > self.payouts.get(best_symbol, 0):
-                best_symbol = match
-        return total_mult, best_symbol
+    def generate_grid(self, outcome_name):
+        """決定した結果に基づいてグリッドを生成する（リーチ演出用）"""
+        # 基本はハズレ図柄で埋める
+        grid = [[self.SYMBOLS["MISS"] for _ in range(3)] for _ in range(3)]
+        
+        # ランダムなハズレ目で埋め尽くす（見た目をバラけさせる）
+        deco_symbols = [v for k, v in self.SYMBOLS.items() if k != "DIAMOND"]
+        for r in range(3):
+            for c in range(3):
+                grid[r][c] = random.choice(deco_symbols)
 
-    def format_grid(self, grid):
+        # 当たりの場合、中央横一列（Payline 2）を書き換える
+        if outcome_name != "MISS":
+            sym = self.SYMBOLS[outcome_name]
+            grid[1] = [sym, sym, sym]
+        else:
+            # ハズレの場合、絶対に揃わないように中央を調整
+            # ただし「惜しい！」と思わせるため、わざとリーチ目(xxo)を作ることもある
+            if random.random() < 0.3: # 30%でリーチハズレ
+                target = random.choice(list(self.SYMBOLS.values()))
+                grid[1] = [target, target, self.SYMBOLS["MISS"]]
+            else:
+                # バラバラにする
+                grid[1][0] = random.choice(deco_symbols)
+                grid[1][1] = random.choice([s for s in deco_symbols if s != grid[1][0]])
+                grid[1][2] = random.choice(deco_symbols)
+
+        return grid
+
+    def format_grid(self, grid, highlight=False):
+        """グリッドを文字列化。highlight=Trueなら中央を目立たせる"""
         rows = []
         for r in range(3):
-            rows.append(f"┃ {' ┃ '.join(grid[r])} ┃")
+            line = f"┃ {' ┃ '.join(grid[r])} ┃"
+            if r == 1 and highlight:
+                line = f"▶ {' ┃ '.join(grid[r])} ◀" # 当たりライン強調
+            rows.append(line)
+        
         sep = "┣━━━╋━━━╋━━━┫"
-        return f"```\n┏━━━┳━━━┳━━━┓\n{rows[0]}\n{sep}\n{rows[1]}\n{sep}\n{rows[2]}\n┗━━━┻━━━┻━━━┛\n```"
+        top = "┏━━━┳━━━┳━━━┓"
+        btm = "┗━━━┻━━━┻━━━┛"
+        return f"```\n{top}\n{rows[0]}\n{sep}\n{rows[1]}\n{sep}\n{rows[2]}\n{btm}\n```"
 
-    @app_commands.command(name="スロット", description="役ごとの演出追加！ハズレはジャックポットにチャージされるよ♡")
+    @app_commands.command(name="スロット", description="80%はハズレ。勝てば天国、負ければ養分。")
     @app_commands.describe(bet="賭け金 (500 Ru 〜)")
     async def slot(self, interaction: discord.Interaction, bet: int):
-        if bet < 500: return await interaction.response.send_message("小銭はお断り。500Ru以上で勝負しなさい！", ephemeral=True)
+        if bet < 500: return await interaction.response.send_message("500Ru以下？冷やかしなら帰って。", ephemeral=True)
         await interaction.response.defer()
         user = interaction.user
 
+        # 1. 残高処理（先払い）
         async with self.bot.get_db() as db:
             async with db.execute("SELECT balance FROM accounts WHERE user_id = ?", (user.id,)) as c:
                 row = await c.fetchone()
                 if not row or row['balance'] < bet:
-                    return await interaction.followup.send("ざぁーこ♡ お金がないなら土下座でもして稼いできなよ？")
+                    return await interaction.followup.send("お金ないじゃん。出直してきな♡")
             
-            # 賭け金の徴収
             await db.execute("UPDATE accounts SET balance = balance - ? WHERE user_id = ?", (bet, user.id))
-            await db.execute("UPDATE accounts SET balance = balance + ? WHERE user_id = 0", (bet,))
+            await db.execute("UPDATE accounts SET balance = balance + ? WHERE user_id = 0", (bet,)) # 全額一旦銀行へ
             await db.commit()
 
-        embed = discord.Embed(title="🎰 Lumen's Arcana Slot", color=0x2f3136)
-        embed.set_author(name=f"{user.display_name}の挑戦", icon_url=user.display_avatar.url)
-        embed.add_field(name="BET", value=f"{bet:,} Ru")
+        # 2. 結果の事前決定（出来レース）
+        outcome_name, multiplier = self.determine_outcome()
+        final_grid = self.generate_grid(outcome_name)
+        
+        # Embed作成
+        embed = discord.Embed(title="🎰 エリュシオン・ドリームスロット", color=0x2f3136)
+        embed.add_field(name="BET", value=f"**{bet:,} Ru**")
+        embed.add_field(name="STATUS", value="Spinning...")
         msg = await interaction.followup.send(embed=embed)
 
-        # リール演出
-        grid = [["⬛", "⬛", "⬛"] for _ in range(3)]
-        for col in range(3):
-            for _ in range(2):
-                temp_col = [random.choice(self.symbols) for _ in range(3)]
-                for r in range(3): grid[r][col] = temp_col[r]
-                embed.description = self.format_grid(grid)
-                await msg.edit(embed=embed)
-                await asyncio.sleep(0.3)
-            real_col = self.get_column()
-            for r in range(3): grid[r][col] = real_col[r]
-            await msg.edit(embed=embed)
+        # 3. 回転演出（これが重要）
+        # 第1リール停止
+        await asyncio.sleep(0.5)
+        # 表示用の一時グリッドを作成
+        disp_grid = [row[:] for row in final_grid]
+        
+        # 第1停止: 左側だけ確定させる
+        disp_grid[0][1] = "🌀"
+        disp_grid[1][1] = "🌀"
+        disp_grid[2][1] = "🌀"
+        disp_grid[0][2] = "🌀"
+        disp_grid[1][2] = "🌀"
+        disp_grid[2][2] = "🌀"
+        
+        embed.description = self.format_grid(disp_grid)
+        await msg.edit(embed=embed)
 
-        multiplier, best_symbol = self.check_win(grid)
+        # 第2リール停止
+        await asyncio.sleep(0.8)
+        disp_grid[0][1] = final_grid[0][1]
+        disp_grid[1][1] = final_grid[1][1]
+        disp_grid[2][1] = final_grid[2][1]
+        embed.description = self.format_grid(disp_grid)
+        await msg.edit(embed=embed)
 
-        # 【演出】ルメン・スマッシュ (10%)
-        if multiplier == 0 and random.random() < 0.10:
-            await asyncio.sleep(0.5)
-            embed.description = self.format_grid(grid) + "\n**「…あーもう！ほら、これあげるわよ！勘違いしないでよね！///」**\n⚡ **Lumen Smash!!** ⚡"
+        # ★リーチ判定（中央ラインの左と中が同じならリーチ）
+        is_reach = (final_grid[1][0] == final_grid[1][1])
+        
+        if is_reach:
+            # リーチ演出
             embed.color = 0xffff00
+            embed.add_field(name="🔥 チャンス！", value="リーチ！来るか…！？", inline=False)
             await msg.edit(embed=embed)
-            await asyncio.sleep(1.2)
-            grid[1] = ["🃏", "🃏", "🃏"]
-            multiplier, best_symbol = self.check_win(grid)
+            await asyncio.sleep(1.5) # 溜め
 
+            # 激アツ演出（高配当確定の場合）
+            if outcome_name in ["SEVEN", "DIAMOND", "WILD"]:
+                embed.description = f"{self.format_grid(disp_grid)}\n{GEKIATSU} **激 ア ツ** {GEKIATSU}\n「こ、これは…！？ 銀行が揺れてる…！？」"
+                embed.color = 0xff0000
+                await msg.edit(embed=embed)
+                await asyncio.sleep(1.5)
+
+        # 第3リール停止（運命の瞬間）
+        await asyncio.sleep(0.5)
+        embed.description = self.format_grid(final_grid, highlight=(multiplier > 0))
+        
+        # 4. 結果処理
         if multiplier > 0:
             payout = bet * multiplier
             async with self.bot.get_db() as db:
                 await db.execute("UPDATE accounts SET balance = balance + ? WHERE user_id = ?", (payout, user.id))
                 await db.commit()
+
+            # 勝った時のセリフ
+            if outcome_name == "DIAMOND":
+                comment = "💎 **JACKPOT!!** 💎\n「う、嘘…！？私の銀行からこんなに持っていくなんて…！身体で返してよ！！///」"
+                color = 0xffffff
+            elif outcome_name == "SEVEN":
+                comment = "7️⃣ **BIG WIN!!** 7️⃣\n「やるじゃない！悔しいけど…おめでとう！」"
+                color = 0xffd700
+            elif outcome_name == "WILD":
+                comment = "🃏 **SUPER WIN!** 🃏\n「あんた、持ってるわね…。ちょっと見直したかも。」"
+                color = 0xff00ff
+            else: # BELL, CHERRY
+                comment = "🎉 **WIN!**\n「ま、これくらいなら小遣いとしてあげるわ。」"
+                color = 0x00ff00
             
-            # --- 【新機能】役ごとのカットイン ---
-            cutin = "な、何よ…運がいいだけなんだからね！"
-            if best_symbol == "💎":
-                cutin = "💎 **DIAMOND!!** 💎\n「え、ちょっと…嘘でしょ！？銀行が破産しちゃう！///」"
-                embed.color = 0xffd700
-            elif best_symbol == "7️⃣":
-                cutin = "7️⃣ **FEVER SEVEN!!** 7️⃣\n「最高にハイな気分！エリュシオンに祝福あれ！」"
-                embed.color = 0xff0000
-            elif best_symbol == "🃏":
-                cutin = "🃏 **LUMEN WILD!!** 🃏\n「私の姿が揃うなんて…あんた、意外とセンスあるじゃない♡」"
-            elif best_symbol == "🍒":
-                cutin = "🍒 **CHERRY** 🍒\n「ちっ、小当たりね。次はもっと大きいのを出しなさいよ？」"
+            embed.clear_fields()
+            embed.add_field(name="RESULT", value=f"**+{payout:,} Ru**", inline=False)
+            embed.color = color
             
-            embed.description = self.format_grid(grid) + f"\n🎉 **WIN! +{payout:,} Ru**\n\n「{cutin}」"
-            if not embed.color: embed.color = 0x00ff00
         else:
-            # --- 【新機能】ジャックポット連携 ---
-            charge_amount = 100 # ハズレ1回につき100Ruチャージ
+            # 負け（ジャックポットチャージ）
+            charge = int(bet * 0.05) # 負け額の5%をプールへ
             async with self.bot.get_db() as db:
                 await db.execute("""
                     INSERT INTO server_config (key, value) VALUES ('jackpot_pool', ?) 
                     ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?
-                """, (charge_amount, charge_amount))
+                """, (charge, charge))
                 await db.commit()
+            
+            # 負けた時の煽り
+            replies = [
+                "養分乙♡ そのRu、美味しく頂くわね！",
+                "あらら、ハズレ。日頃の行いが悪いんじゃない？w",
+                "ざぁ〜こ♡ 悔しかったらもっと賭けなさいよ！",
+                "あーあ。銀行の肥やしが増えちゃった♡"
+            ]
+            comment = f"💀 **LOSE...**\n「{random.choice(replies)}」"
+            embed.color = 0x2f3136
+            embed.clear_fields()
+            embed.set_footer(text="負け額の一部はジャックポットに貯蓄されました")
 
-            embed.description = self.format_grid(grid) + f"\n💀 **LOSE...**\n「はい没収ー♡ あんたのRuはジャックポットに貯めておいてあげるね？」"
-            embed.set_footer(text=f"ハズレにより 100 Ru がジャックポットにチャージされました🔥")
-            embed.color = 0xff0000
-
+        embed.description += f"\n\n{comment}"
         await msg.edit(embed=embed)
+
 
 class ServerStats(commands.Cog):
     def __init__(self, bot):
