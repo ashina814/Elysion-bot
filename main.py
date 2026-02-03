@@ -1943,7 +1943,7 @@ class Chinchiro(commands.Cog):
         
         await msg.edit(embed=embed, view=None)
 
- class Slot(commands.Cog):
+class Slot(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         # 絵柄定義
