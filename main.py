@@ -2034,7 +2034,13 @@ class Slot(commands.Cog):
         btm = pre + "┗━━━━━━━━━━━━━━━┛" + suf
         
         return f"```ansi\n{top}\n{rows[0]}\n{sep}\n{rows[1]}\n{sep}\n{rows[2]}\n{btm}\n```"
-
+# --- 【NEW】現在設定の確認コマンド ---
+    @app_commands.command(name="設定確認", description="【管理者】現在のスロット設定値を確認します")
+    @has_permission("ADMIN")
+    async def check_slot_config(self, interaction: discord.Interaction):
+        mode = await self.get_current_mode()
+        mode_info = self.MODES.get(mode, {"name": "不明"})
+        await interaction.response.send_message(f"🕵️‍♂️ 現在の設定: **{mode_info['name']}** (Mode ID: {mode})", ephemeral=True)
     # --- 設定コマンド (1~6対応) ---
     @app_commands.command(name="スロット設定", description="【管理者】スロットの設定(1~6)を変更します")
     @app_commands.describe(mode="設定値 (1-6, GOD)")
