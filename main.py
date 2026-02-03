@@ -2141,7 +2141,7 @@ class Slot(commands.Cog):
         msg = await interaction.followup.send(embed=embed)
 
         # 3. 回転演出
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.8)
         # 第1停止
         disp_grid = [row[:] for row in (temp_miss_grid if is_respin else final_grid)]
         # まだ隠す
@@ -2152,7 +2152,7 @@ class Slot(commands.Cog):
         await msg.edit(embed=embed)
 
         # 第2停止
-        await asyncio.sleep(0.8)
+        await asyncio.sleep(1.0)
         disp_grid[0][1], disp_grid[1][1], disp_grid[2][1] = \
             (temp_miss_grid if is_respin else final_grid)[0][1], \
             (temp_miss_grid if is_respin else final_grid)[1][1], \
@@ -2170,7 +2170,7 @@ class Slot(commands.Cog):
             await asyncio.sleep(1.5)
 
         # 第3停止
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(1.0)
         
         if is_respin:
             # 一旦ハズレ目を出す
