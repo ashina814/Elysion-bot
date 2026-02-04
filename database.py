@@ -1,5 +1,6 @@
 import aiosqlite
 import logging
+import datetime
 
 # ログ設定
 logging.basicConfig(level=logging.INFO, format='%(asctime)s:%(levelname)s:%(name)s: %(message)s')
@@ -16,6 +17,7 @@ class Database:
         self.db_path = DB_PATH
 
     async def get_connection(self):
+        """DB接続を取得し、WALモード等の設定を行う"""
         conn = await aiosqlite.connect(self.db_path, timeout=30.0)
         conn.row_factory = aiosqlite.Row
         await conn.execute("PRAGMA journal_mode=WAL")
@@ -57,7 +59,6 @@ class Database:
             await db.execute("CREATE TABLE IF NOT EXISTS user_settings (user_id INTEGER PRIMARY KEY, dm_salary_enabled INTEGER DEFAULT 1)")
             
             # ▼▼▼ 追加機能1: Bot利用禁止リスト（口座凍結） ▼▼▼
-            # 悪質なユーザーをBotからBANします（サーバーには居られる）。
             await db.execute("""CREATE TABLE IF NOT EXISTS bot_bans (
                 user_id INTEGER PRIMARY KEY,
                 reason TEXT,
@@ -89,8 +90,6 @@ class Database:
             await db.execute("CREATE TABLE IF NOT EXISTS shop_subscriptions (user_id INTEGER, role_id INTEGER, expiry_date TEXT, PRIMARY KEY (user_id, role_id))")
 
             # ▼▼▼ 追加機能2: アイテムインベントリ（所持品） ▼▼▼
-            # ロール以外のアイテム（銀次ガード、ガチャチケなど）を管理します。
-            # item_id: 'ginji_guard', 'gacha_ticket' などの文字列で管理想定
             await db.execute("""CREATE TABLE IF NOT EXISTS user_inventory (
                 user_id INTEGER,
                 item_id TEXT,
@@ -112,7 +111,7 @@ class Database:
                 PRIMARY KEY (message_id, emoji)
             )""")
 
-            # クールダウン（連投防止）
+            # クールダウン
             await db.execute("""CREATE TABLE IF NOT EXISTS cooldowns (
                 user_id INTEGER,
                 command_name TEXT,
@@ -120,7 +119,7 @@ class Database:
                 PRIMARY KEY (user_id, command_name)
             )""")
 
-            # ゲームマスターデータ（ガチャの中身など）
+            # ゲームマスターデータ
             await db.execute("""CREATE TABLE IF NOT EXISTS game_master_data (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 category TEXT,
@@ -128,13 +127,82 @@ class Database:
                 added_by INTEGER
             )""")
 
-            # ==========================================
             # インデックス
-            # ==========================================
             await db.execute("CREATE INDEX IF NOT EXISTS idx_trans_receiver ON transactions (receiver_id, created_at DESC)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_temp_vc_expire ON temp_vcs (expire_at)")
             
             await db.commit()
-            logger.info("✅ Database setup complete (Final Version: Inventory & Ban System added).")
+            logger.info("✅ Database setup complete (Final Version).")
 
+    # ==========================================================
+    # ▼▼▼ ここから下が新しく追加した「共通機能」です ▼▼▼
+    # ==========================================================
+
+    async def get_balance(self, user_id: int) -> int:
+        """【共通】ユーザーの残高を取得する"""
+        async with await self.get_connection() as conn:
+            async with conn.execute("SELECT balance FROM accounts WHERE user_id = ?", (user_id,)) as cursor:
+                row = await cursor.fetchone()
+                return row['balance'] if row else 0
+
+    async def update_balance(self, user_id: int, amount: int, transaction_type: str, description: str, batch_id: str = None) -> bool:
+        """
+        【共通】残高の増減と履歴保存を安全に行う最強のメソッド。
+        銀行BotもカジノBotも、お金を動かす時はこれを使うだけでOK。
+        
+        Args:
+            user_id: ユーザーID
+            amount: 増減額（マイナスなら支払い、プラスなら収入）
+            transaction_type: 'SLOT', 'SALARY', 'TRANSFER' など
+            description: 履歴に載る説明文
+        
+        Returns:
+            bool: 成功ならTrue、残高不足やエラーならFalse
+        """
+        async with await self.get_connection() as conn:
+            try:
+                # 1. ユーザー口座がなければ自動作成 (初期値0)
+                await conn.execute("INSERT OR IGNORE INTO accounts (user_id, balance, total_earned) VALUES (?, 0, 0)", (user_id,))
+                
+                # 2. 支払い(マイナス)の場合、残高が足りるかチェック
+                if amount < 0:
+                    async with conn.execute("SELECT balance FROM accounts WHERE user_id = ?", (user_id,)) as cursor:
+                        row = await cursor.fetchone()
+                        if not row or row['balance'] < abs(amount):
+                            return False # 残高不足で失敗
+
+                # 3. 残高を更新
+                # プラスの時だけ total_earned (生涯獲得額) も増やす
+                earn_add = amount if amount > 0 else 0
+                
+                await conn.execute("""
+                    UPDATE accounts 
+                    SET balance = balance + ?, total_earned = total_earned + ?
+                    WHERE user_id = ?
+                """, (amount, earn_add, user_id))
+
+                # 4. 取引履歴を保存
+                month_tag = datetime.datetime.now().strftime("%Y-%m")
+                # amountがマイナスでも、履歴にはそのまま記録（例: -500）
+                # receiver_id は「お金が動いた対象」として記録
+                await conn.execute("""
+                    INSERT INTO transactions (receiver_id, amount, type, description, batch_id, month_tag)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (user_id, amount, transaction_type, description, batch_id, month_tag))
+
+                await conn.commit()
+                return True # 成功
+
+            except Exception as e:
+                logger.error(f"Transaction Error ({transaction_type}): {e}")
+                await conn.rollback()
+                raise e # Bot側でエラーハンドリングさせるために例外を投げる
+
+    async def is_banned(self, user_id: int) -> bool:
+        """【共通】ユーザーがBot利用禁止(BAN)されているか確認"""
+        async with await self.get_connection() as conn:
+            async with conn.execute("SELECT 1 FROM bot_bans WHERE user_id = ?", (user_id,)) as cursor:
+                return await cursor.fetchone() is not None
+
+# インスタンスを作成しておく（他のファイルからは from database import db で使える）
 db = Database()
