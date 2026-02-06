@@ -667,7 +667,6 @@ class Economy(commands.Cog):
                 return True
         return False
 
-
 class Salary(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -693,12 +692,14 @@ class Salary(commands.Cog):
     @app_commands.command(name="一括給与", description="【最高神】全役職の給与を合算支給し、明細をDM送信します")
     @has_permission("SUPREME_GOD")
     async def distribute_all(self, interaction: discord.Interaction):
+        # 処理が長引く可能性があるため、タイムアウトを回避（最大15分猶予）
         await interaction.response.defer()
         
         now = datetime.datetime.now()
         month_tag = now.strftime("%Y-%m")
         batch_id = str(uuid.uuid4())[:8]
         
+        # --- 1. データ準備 ---
         wage_dict = {}
         dm_prefs = {}
         async with self.bot.get_db() as db:
@@ -710,52 +711,83 @@ class Salary(commands.Cog):
         if not wage_dict:
             return await interaction.followup.send("⚠️ 給与設定が見つかりません。")
         
+        # メンバーリスト取得
+        members = interaction.guild.members if interaction.guild.chunked else [m async for m in interaction.guild.fetch_members()]
+
+        # --- 2. 計算処理（メモリ上で処理） ---
         count = 0
         total_payout = 0
         role_summary = {}
         payout_data_list = []
 
-        members = interaction.guild.members if interaction.guild.chunked else [m async for m in interaction.guild.fetch_members()]
+        # DB一括書き込み用のリスト
+        account_updates = []
+        transaction_inserts = []
 
-        async with self.bot.get_db() as db:
-            for member in members:
-                if member.bot: continue
-                
-                matching = [(wage_dict[r.id], r) for r in member.roles if r.id in wage_dict]
-                if not matching: continue
-                
-                member_total = sum(w for w, _ in matching)
-                
-                await db.execute("""
-                    INSERT INTO accounts (user_id, balance, total_earned) VALUES (?, ?, ?)
-                    ON CONFLICT(user_id) DO UPDATE SET 
-                    balance = balance + excluded.balance, total_earned = total_earned + excluded.total_earned
-                """, (member.id, member_total, member_total))
-                
-                await db.execute("""
-                    INSERT INTO transactions (sender_id, receiver_id, amount, type, batch_id, month_tag, description)
-                    VALUES (0, ?, ?, 'SALARY', ?, ?, ?)
-                """, (member.id, member_total, batch_id, month_tag, f"{month_tag} 給与"))
+        for member in members:
+            if member.bot: continue
+            
+            matching = [(wage_dict[r.id], r) for r in member.roles if r.id in wage_dict]
+            if not matching: continue
+            
+            member_total = sum(w for w, _ in matching)
+            
+            # DB書き込み用データをリストに追加 (SQLのパラメータ順に合わせる)
+            # accounts: user_id, balance, total_earned
+            account_updates.append((member.id, member_total, member_total))
+            
+            # transactions: sender, receiver, amount, type, batch_id, month, desc
+            transaction_inserts.append((
+                0, member.id, member_total, 'SALARY', batch_id, month_tag, f"{month_tag} 給与"
+            ))
 
-                count += 1
-                total_payout += member_total
-                for w, r in matching:
-                    if r.id not in role_summary: role_summary[r.id] = {"mention": r.mention, "count": 0, "amount": 0}
-                    role_summary[r.id]["count"] += 1
-                    role_summary[r.id]["amount"] += w
+            count += 1
+            total_payout += member_total
+            
+            # 集計用ロジック
+            for w, r in matching:
+                if r.id not in role_summary: role_summary[r.id] = {"mention": r.mention, "count": 0, "amount": 0}
+                role_summary[r.id]["count"] += 1
+                role_summary[r.id]["amount"] += w
 
-                if dm_prefs.get(member.id, True):
-                    payout_data_list.append((member, member_total, matching))
+            if dm_prefs.get(member.id, True):
+                payout_data_list.append((member, member_total, matching))
 
-            await db.commit()
+        # --- 3. DB一括書き込み (高速化の肝) ---
+        if account_updates:
+            async with self.bot.get_db() as db:
+                try:
+                    # executemanyを使って1回の通信で全員分書き込む
+                    await db.executemany("""
+                        INSERT INTO accounts (user_id, balance, total_earned) VALUES (?, ?, ?)
+                        ON CONFLICT(user_id) DO UPDATE SET 
+                        balance = balance + excluded.balance, total_earned = total_earned + excluded.total_earned
+                    """, account_updates)
 
+                    await db.executemany("""
+                        INSERT INTO transactions (sender_id, receiver_id, amount, type, batch_id, month_tag, description)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, transaction_inserts)
+
+                    await db.commit()
+                except Exception as e:
+                    await db.rollback()
+                    return await interaction.followup.send(f"❌ DBエラーが発生しました: {e}")
+        else:
+             return await interaction.followup.send("⚠️ 給与対象者がいませんでした。")
+
+        # --- 4. DM送信 (レート制限対策付き) ---
         sent_dm = 0
         for m, total, matching in payout_data_list:
             try:
                 embed = self.create_salary_slip_embed(m, total, matching, month_tag)
                 await m.send(embed=embed)
                 sent_dm += 1
-            except: pass
+                # Discord APIのレート制限（BAN）回避のため、5件ごとに1秒休む
+                if sent_dm % 5 == 0: 
+                    await asyncio.sleep(1) 
+            except:
+                pass
 
         await interaction.followup.send(f"💰 **一括支給完了** (ID: `{batch_id}`)\n人数: {count}名 / 総額: {total_payout:,} Ster\n通知送信: {sent_dm}名")
         await self.send_salary_log(interaction, batch_id, total_payout, count, role_summary, now)
