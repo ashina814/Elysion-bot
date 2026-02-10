@@ -3146,7 +3146,7 @@ class CestaBankBot(commands.Bot):
         await self.tree.sync()
         logger.info("StellaBank System: Setup complete and All Cogs Synced.")
 
-async def send_bank_log(self, log_key: str, embed: discord.Embed):
+    async def send_bank_log(self, log_key: str, embed: discord.Embed):
         """
         指定されたキー（currency_log_id, salary_log_id 等）の設定を読み込み、
         対応するチャンネルへログを送信します。
