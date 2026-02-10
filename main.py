@@ -2821,9 +2821,8 @@ class AdminTools(commands.Cog):
     @app_commands.choices(log_type=[
         discord.app_commands.Choice(name="通貨ログ (送金など)", value="currency_log_id"),
         discord.app_commands.Choice(name="給与ログ (一斉支給)", value="salary_log_id"),
-        discord.app_commands.Choice(name="面接ログ (合格通知)", value="interview_log_id")
-    ])
-        discord.app_commands.Choice(name="チャット削除ログ", value="chat_log_id") 
+        discord.app_commands.Choice(name="面接ログ (合格通知)", value="interview_log_id"), # ここにカンマが必要です
+        discord.app_commands.Choice(name="チャット削除ログ", value="chat_log_id")   # これをリストの中に入れます
     ])
     @has_permission("SUPREME_GOD")
     async def config_log_channel(self, interaction: discord.Interaction, log_type: str, channel: discord.TextChannel):
@@ -2833,7 +2832,7 @@ class AdminTools(commands.Cog):
             await db.commit()
         await self.bot.config.reload()
         await interaction.followup.send(f"✅ **{channel.mention}** をログ出力先に設定しました。", ephemeral=True)
-
+        
     @app_commands.command(name="面接の除外ロール設定", description="面接コマンドでスキップするロール（説明者など）を設定")
     @has_permission("SUPREME_GOD")
     async def config_exclude_role(self, interaction: discord.Interaction, role: discord.Role):
