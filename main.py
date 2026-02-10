@@ -2296,8 +2296,152 @@ class Slot(commands.Cog):
             traceback.print_exc()
             await interaction.followup.send(f"❌ エラー: `{e}`", ephemeral=True)
 
+# グラフ描画関数をクラスの外（または静的メソッド）に出し、同期関数として定義します
+def generate_economy_dashboard(balances, history, flow_stats, type_breakdown, total_asset, avg_asset, active_citizens, active_days):
+    """
+    重い描画処理を行う関数（別スレッドで実行される）
+    """
+    plt.style.use('dark_background')
+    
+    # キャンバスサイズを横長にしてダッシュボード感を出す
+    fig = plt.figure(figsize=(20, 9))
+    gs = fig.add_gridspec(2, 3) # 2行3列のグリッド
 
-# --- Cog: ServerStats (究極の経済白書版) ---
+    # --- 1. 左エリア: マクロ経済推移 ---
+    ax1 = fig.add_subplot(gs[0, 0]) # 資産推移
+    dates = [r['date'][5:] for r in history]
+    totals = [r['total_balance'] for r in history]
+    ax1.plot(dates, totals, marker='o', color='#00d2ff', linewidth=2.5)
+    ax1.fill_between(dates, totals, color='#00d2ff', alpha=0.1)
+    ax1.set_title(f"Money Supply Trend (Total: {total_asset:,} S)", fontweight='bold', color='white')
+    ax1.grid(True, alpha=0.2, linestyle='--')
+    if len(dates) > 6: ax1.set_xticks(dates[::max(1, len(dates)//4)])
+
+    ax4 = fig.add_subplot(gs[1, 0]) # 取引内訳(円グラフ)
+    if type_breakdown:
+        sorted_types = sorted(type_breakdown.items(), key=lambda x: x[1], reverse=True)
+        # 上位4つ + その他
+        top_n = 4
+        labels = [k for k, v in sorted_types[:top_n]]
+        sizes = [v for k, v in sorted_types[:top_n]]
+        if len(sorted_types) > top_n:
+            labels.append("Others")
+            sizes.append(sum(v for k, v in sorted_types[top_n:]))
+        
+        wedges, texts, autotexts = ax4.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90, 
+                                           counterclock=False, colors=plt.cm.Set3.colors, pctdistance=0.85)
+        # ドーナツ化
+        centre_circle = plt.Circle((0,0),0.70,fc='#2f3136')
+        ax4.add_artist(centre_circle)
+        ax4.text(0, 0, "GDP Breakdown", ha='center', va='center', color='white', fontweight='bold')
+        for t in texts: t.set_color('white')
+        for t in autotexts: t.set_color('black')
+    else:
+        ax4.text(0.5, 0.5, "No Data", ha='center', color='gray')
+    ax4.axis('equal')
+
+    # --- 2. 中央エリア: 格差と分布 ---
+    # ヒストグラム (階級分布)
+    ax2 = fig.add_subplot(gs[0, 1])
+    bins = [0, 1000, 10000, 50000, 100000, 500000, 1000000, float('inf')]
+    labels_hist = ['~1k', '10k', '50k', '100k', '500k', '1M', '1M+']
+    counts = [0] * len(labels_hist)
+    for b in balances:
+        for i, limit in enumerate(bins[1:]):
+            if b < limit:
+                counts[i] += 1
+                break
+    ax2.bar(labels_hist, counts, color='#f1c40f', alpha=0.8, edgecolor='white')
+    ax2.set_title("Wealth Class Distribution", fontweight='bold', color='white')
+    ax2.tick_params(axis='x', rotation=45)
+    ax2.grid(axis='y', alpha=0.2)
+
+    # ローレンツ曲線 (格差の可視化)
+    ax5 = fig.add_subplot(gs[1, 1])
+    ax5.plot([0, 1], [0, 1], color='gray', linestyle='--', label='Equality')
+    
+    count = len(balances)
+    if total_asset > 0 and count > 0:
+        sorted_bal = sorted(balances)
+        lorenz_x = [i / count for i in range(count + 1)]
+        # numpyなしで累積和
+        cum = 0
+        cum_assets = [0]
+        for b in sorted_bal:
+            cum += b
+            cum_assets.append(cum)
+        lorenz_y = [c / total_asset for c in cum_assets]
+        
+        # ジニ係数計算
+        gini = (2 * sum((i + 1) * v for i, v in enumerate(sorted_bal)) / (count * total_asset)) - (count + 1) / count
+        
+        ax5.plot(lorenz_x, lorenz_y, color='#ff00ff', linewidth=3, label=f'Gini: {gini:.3f}')
+        ax5.fill_between(lorenz_x, lorenz_x, lorenz_y, color='#ff00ff', alpha=0.15)
+        ax5.legend(loc='upper left')
+    ax5.set_title("Inequality Curve", fontweight='bold', color='white')
+    ax5.grid(True, alpha=0.3)
+
+    # --- 3. 右エリア: 統計サマリー (テキスト埋め込み) ---
+    ax3 = fig.add_subplot(gs[:, 2]) # 縦長に使用
+    ax3.axis('off') # 軸を消す
+    
+    # 統計データのテキスト化
+    net_flow = flow_stats['mint'] - flow_stats['burn']
+    flow_color = "#2ecc71" if net_flow >= 0 else "#e74c3c"
+    flow_sign = "+" if net_flow >= 0 else ""
+    
+    # トップ富豪（匿名化せず表示、またはID表示）
+    # ここではデータがないのでプレースホルダーですが、balancesと一緒に名前も渡せばランキング作れます
+    
+    text_content = [
+        f"== ECONOMY REPORT ==",
+        f"Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"",
+        f"[ CITIZENS ]",
+        f"Active Users : {active_citizens} citizens",
+        f"Avg Wealth   : {int(avg_asset):,} S",
+        f"Median Wealth: {int(sorted(balances)[len(balances)//2]) if balances else 0:,} S",
+        f"",
+        f"[ FLOW (24h) ]",
+        f"Mint (In)    : {flow_stats['mint']:,} S",
+        f"Burn (Out)   : {flow_stats['burn']:,} S",
+        f"-----------------------",
+        f"Net Flow     : {flow_sign}{net_flow:,} S",
+        f"",
+        f"[ VELOCITY ]",
+        f"GDP (Volume) : {flow_stats['gdp']:,} S",
+        f"Turnover Rate: {(flow_stats['gdp']/total_asset*100) if total_asset else 0:.2f} %",
+        f"",
+        f"[ ANALYSIS ]",
+        f"Target Period: Last {active_days} Days",
+    ]
+    
+    # テキストを描画
+    y_pos = 0.95
+    for line in text_content:
+        color = 'white'
+        weight = 'normal'
+        size = 14
+        
+        if "== " in line: 
+            size = 18; weight='bold'; color='#00d2ff'
+        if "Net Flow" in line:
+            color = flow_color; weight='bold'
+        if "[" in line and "]" in line:
+            color = '#f1c40f'; weight='bold'
+            
+        ax3.text(0.05, y_pos, line, transform=ax3.transAxes, fontsize=size, color=color, fontweight=weight, family='monospace')
+        y_pos -= 0.05
+
+    plt.tight_layout()
+    
+    # バッファに保存
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=100) # dpi調整で画質確保
+    buf.seek(0)
+    plt.close()
+    return buf
+
 class ServerStats(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -2307,14 +2451,13 @@ class ServerStats(commands.Cog):
     def cog_unload(self):
         self.daily_log_task.cancel()
 
-    # 市民の残高リストと、アクティブな市民数を取得
-    async def get_economic_data(self):
+    async def get_economic_details(self):
+        """経済データを詳細に収集する"""
         guild = self.bot.guilds[0]
-        if not guild.chunked:
-            await guild.chunk()
+        if not guild.chunked: await guild.chunk()
 
         async with self.bot.get_db() as db:
-            # 設定読み込み
+            # 1. 設定読み込み
             god_role_ids = [r_id for r_id, level in self.bot.config.admin_roles.items() if level == "SUPREME_GOD"]
             citizen_role_id = None
             active_days = 30
@@ -2323,41 +2466,49 @@ class ServerStats(commands.Cog):
                     if row['key'] == 'citizen_role_id': citizen_role_id = int(row['value'])
                     elif row['key'] == 'active_threshold_days': active_days = int(row['value'])
 
-            # アクティブユーザー特定
+            # 2. アクティブユーザー判定 & 口座取得
             cutoff = datetime.datetime.now() - datetime.timedelta(days=active_days)
-            async with db.execute("SELECT DISTINCT sender_id, receiver_id FROM transactions WHERE created_at > ?", (cutoff,)) as cursor:
-                rows = await cursor.fetchall()
-                active_ids = {r[0] for r in rows} | {r[1] for r in rows}
-
-            # 全口座取得
             async with db.execute("SELECT user_id, balance FROM accounts") as cursor:
-                all_balances = {row['user_id']: row['balance'] for row in await cursor.fetchall()}
+                all_accounts = await cursor.fetchall()
 
-            # 24時間以内の取引総額 (GDPの指標)
+            async with db.execute("SELECT DISTINCT sender_id FROM transactions WHERE created_at > ? UNION SELECT DISTINCT receiver_id FROM transactions WHERE created_at > ?", (cutoff, cutoff)) as cursor:
+                rows = await cursor.fetchall()
+                active_ids = {r[0] for r in rows}
+
+            # 3. 24時間以内の動向分析
             cutoff_24h = datetime.datetime.now() - datetime.timedelta(days=1)
-            async with db.execute("SELECT SUM(amount) FROM transactions WHERE created_at > ?", (cutoff_24h,)) as c:
-                res = await c.fetchone()
-                daily_volume = res[0] if res[0] else 0
+            flow_stats = {"mint": 0, "burn": 0, "transfer": 0, "gdp": 0}
+            type_breakdown = {}
 
-        # 集計対象のフィルタリング
+            query = "SELECT sender_id, receiver_id, amount, type FROM transactions WHERE created_at > ?"
+            async with db.execute(query, (cutoff_24h,)) as cursor:
+                async for row in cursor:
+                    s_id, r_id, amt, t_type = row['sender_id'], row['receiver_id'], row['amount'], row['type']
+                    flow_stats["gdp"] += amt
+                    type_breakdown[t_type] = type_breakdown.get(t_type, 0) + amt
+                    if s_id == 0: flow_stats["mint"] += amt
+                    elif r_id == 0: flow_stats["burn"] += amt
+                    else: flow_stats["transfer"] += amt
+
+        # 4. 市民データのフィルタリング
         valid_balances = []
-        for member in guild.members:
-            if member.bot: continue
-            if any(role.id in god_role_ids for role in member.roles): continue # 神は除外
-            if citizen_role_id and not any(role.id == citizen_role_id for role in member.roles): continue # 市民以外除外
-            if member.id not in active_ids: continue # 非アクティブ除外
-            
-            valid_balances.append(all_balances.get(member.id, 0))
-        
-        return valid_balances, daily_volume, active_days
+        for row in all_accounts:
+            uid, bal = row['user_id'], row['balance']
+            member = guild.get_member(uid)
+            if not member or member.bot: continue
+            if any(r.id in god_role_ids for r in member.roles): continue
+            if citizen_role_id and not any(r.id == citizen_role_id for r in member.roles): continue
+            if uid not in active_ids: continue
+            valid_balances.append(bal)
+
+        return valid_balances, flow_stats, type_breakdown, active_days
 
     @tasks.loop(hours=24)
     async def daily_log_task(self):
         try:
-            balances, _, _ = await self.get_economic_data()
+            balances, _, _, _ = await self.get_economic_details()
             total = sum(balances)
             today = datetime.datetime.now().strftime("%Y-%m-%d")
-            
             async with self.bot.get_db() as db:
                 await db.execute("CREATE TABLE IF NOT EXISTS daily_stats (date TEXT PRIMARY KEY, total_balance INTEGER)")
                 await db.execute("INSERT OR REPLACE INTO daily_stats (date, total_balance) VALUES (?, ?)", (today, total))
@@ -2365,140 +2516,48 @@ class ServerStats(commands.Cog):
         except Exception as e:
             logger.error(f"Daily Log Error: {e}")
 
-    @app_commands.command(name="経済グラフ", description="サーバー経済の健全性・格差・GDPを分析したレポートを発行します")
+    @app_commands.command(name="経済グラフ", description="サーバー経済の詳細ダッシュボードを生成します（非同期生成）")
     @has_permission("ADMIN")
     async def economy_graph(self, interaction: discord.Interaction):
+        # 処理開始を通知（これでタイムアウトを防ぐ）
         await interaction.response.defer()
         
         try:
-            # 1. データ収集
-            balances, daily_volume, active_days = await self.get_economic_data()
-            balances.sort() # 安い順にソート
+            # 1. データの収集（DBアクセスは非同期で軽いのでそのまま）
+            balances, flow_stats, type_breakdown, active_days = await self.get_economic_details()
             
+            # データ加工
+            balances.sort()
             count = len(balances)
             total_asset = sum(balances)
             avg_asset = total_asset / count if count > 0 else 0
-            
-            # 2. 高度な指標計算
-            # ジニ係数
-            gini = 0.0
-            if count > 0 and total_asset > 0:
-                gini = (2 * sum((i + 1) * v for i, v in enumerate(balances)) / (count * total_asset)) - (count + 1) / count
 
-            # 富の集中度 (上位10%が持つ資産の割合)
-            top_10_count = max(1, int(count * 0.1))
-            top_10_asset = sum(balances[-top_10_count:])
-            wealth_concentration = (top_10_asset / total_asset * 100) if total_asset > 0 else 0
-
-            # 3. 過去データとの比較 (インフレ率)
-            yesterday_str = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-            
+            # 履歴データの取得
             async with self.bot.get_db() as db:
-                # 履歴取得
                 async with db.execute("SELECT date, total_balance FROM daily_stats ORDER BY date ASC") as c:
                     history = await c.fetchall()
-                # 昨日のデータ取得
-                async with db.execute("SELECT total_balance FROM daily_stats WHERE date = ?", (yesterday_str,)) as c:
-                    y_row = await c.fetchone()
-                    yesterday_total = y_row['total_balance'] if y_row else None
 
-            # インフレ率計算
-            if yesterday_total and yesterday_total > 0:
-                diff = total_asset - yesterday_total
-                inflation_rate = (diff / yesterday_total) * 100
-                inflation_text = f"{'📈' if diff >= 0 else '📉'} {diff:+,} S ({inflation_rate:+.2f}%)"
-            else:
-                inflation_text = "🔰 データ不足 (比較対象なし)"
+            # 2. 【重要】グラフ描画を別スレッドで実行
+            # これにより、matplotlibがBot本体の動作を止めるのを防ぎます
+            loop = asyncio.get_running_loop()
+            buf = await loop.run_in_executor(
+                None, 
+                generate_economy_dashboard, 
+                balances, history, flow_stats, type_breakdown, total_asset, avg_asset, count, active_days
+            )
 
-            # 4. レポートの装飾判定
-            # ジニ係数判定
-            if gini < 0.3: gini_rate, g_color = "🟢 健全", 0x2ecc71
-            elif gini < 0.45: gini_rate, g_color = "🟡 注意", 0xf1c40f
-            elif gini < 0.6: gini_rate, g_color = "🟠 警戒", 0xe67e22
-            else: gini_rate, g_color = "🔴 危険", 0xe74c3c
-
-            # 5. グラフ描画 (2画面構成: 左=資産推移, 右=ローレンツ曲線)
-            plt.style.use('dark_background')
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+            # 3. 結果の送信
+            file = discord.File(buf, filename="economy_dashboard.png")
             
-            # --- 左: 経済成長グラフ (Money Supply) ---
-            dates = [r['date'][5:] for r in history] # 月-日 だけ抽出
-            totals = [r['total_balance'] for r in history]
-            
-            ax1.plot(dates, totals, marker='o', color='#00b0f4', linewidth=2, label='Total Supply')
-            ax1.set_title(f"Money Supply History (Total: {total_asset:,} S)", fontsize=14, color='white')
-            ax1.grid(True, alpha=0.3)
-            ax1.legend()
-            if len(dates) > 10: # データが多い場合はラベルを間引く
-                ax1.set_xticks(dates[::max(1, len(dates)//5)])
-
-            # --- 右: 格差の可視化 (Lorenz Curve) ---
-            # 完全平等の線
-            ax2.plot([0, 1], [0, 1], color='gray', linestyle='--', label='Perfect Equality')
-            
-            # 実際の分布
-            if total_asset > 0:
-                lorenz_x = [i / count for i in range(count + 1)]
-                # 累積和を計算して正規化
-                if np:
-                    cum_assets = [0] + list(np.cumsum(balances))
-                else:
-                    cum = 0
-                    cum_assets = [0]
-                    for b in balances:
-                        cum += b
-                        cum_assets.append(cum)
-                
-                lorenz_y = [c / total_asset for c in cum_assets]
-                
-                ax2.plot(lorenz_x, lorenz_y, color='#ff00ff', linewidth=3, label=f'Actual (Gini: {gini:.3f})')
-                ax2.fill_between(lorenz_x, lorenz_x, lorenz_y, color='#ff00ff', alpha=0.1) # 面積塗りつぶし
-
-            ax2.set_title("Wealth Distribution (Inequality)", fontsize=14, color='white')
-            ax2.set_xlabel("Cumulative Share of People")
-            ax2.set_ylabel("Cumulative Share of Wealth")
-            ax2.legend()
-            ax2.grid(True, alpha=0.3)
-
-            # 保存
-            buf = io.BytesIO()
-            plt.savefig(buf, format='png', bbox_inches='tight')
-            buf.seek(0)
-            file = discord.File(buf, filename="economy_report.png")
-            plt.close()
-
-            # 6. Embed作成
-            embed = discord.Embed(title="📊 ステラ国家経済白書", color=g_color, timestamp=datetime.datetime.now())
-            embed.set_author(name=f"発行: {interaction.guild.name} 中央銀行", icon_url=interaction.guild.icon.url if interaction.guild.icon else None)
-            
-            # 上段: マクロ経済指標
-            embed.add_field(name="💰 マネーサプライ (総資産)", value=f"**{total_asset:,} Stell**", inline=True)
-            embed.add_field(name="📈 前日比 (インフレ率)", value=inflation_text, inline=True)
-            embed.add_field(name="👥 アクティブ市民", value=f"{count} 名", inline=True)
-            
-            # 中段: 活性度
-            gdp_text = f"**{daily_volume:,} Stell**"
-            velocity = (daily_volume / total_asset * 100) if total_asset > 0 else 0
-            embed.add_field(name="🔄 24H取引高 (GDP)", value=gdp_text, inline=True)
-            embed.add_field(name="⚡ 経済回転率", value=f"{velocity:.2f}% /日", inline=True)
-            embed.add_field(name="💵 平均資産", value=f"{int(avg_asset):,} Stell", inline=True)
-
-            # 下段: 格差データ
-            embed.add_field(name="⚖️ ジニ係数 (格差)", value=f"**{gini:.3f}** [{gini_rate}]", inline=True)
-            embed.add_field(name="👑 富の集中度", value=f"上位10%が資産の **{wealth_concentration:.1f}%** を占有", inline=False)
-
-            embed.set_image(url="attachment://economy_report.png")
-            embed.set_footer(text=f"集計対象: 過去{active_days}日以内に活動履歴のある市民")
+            embed = discord.Embed(title="📊 ステラ経済ダッシュボード", color=0x2b2d31)
+            embed.set_image(url="attachment://economy_dashboard.png")
+            embed.set_footer(text=f"Generated in background thread | {datetime.datetime.now().strftime('%H:%M:%S')}")
 
             await interaction.followup.send(embed=embed, file=file)
 
         except Exception as e:
-            logger.error(f"Economy Report Error: {e}")
+            traceback.print_exc()
             await interaction.followup.send(f"❌ レポート生成中にエラーが発生しました: {e}")
-
-
-
-
 
 class ShopPurchaseView(discord.ui.View):
     def __init__(self, bot, role_id, price, shop_id):
@@ -3007,10 +3066,11 @@ class InterviewSystem(commands.Cog):
             for member in channel.members:
                 # Botはスキップ
                 if member.bot: continue
-                
+
                 # 除外ロールを持っている場合はスキップ
                 if exclude_role_id:
-                    if member.get_role(exclude_role_id):
+                    # ロールIDリストの中に exclude_role_id があるか確認
+                    if any(r.id == exclude_role_id for r in member.roles):
                         continue
                 
                 # ターゲットロールを持っていない場合はスキップ（安全策）
