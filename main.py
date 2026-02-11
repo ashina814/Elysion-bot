@@ -121,10 +121,13 @@ def has_permission(required_level: str):
 class BankDatabase:
     def __init__(self, db_path="stella_bank_v1.db"):
         self.db_path = db_path
+
     async def setup(self, conn):
         # 高速化設定
         await conn.execute("PRAGMA journal_mode=WAL")
         await conn.execute("PRAGMA synchronous=NORMAL")
+        # ▼ 追加: 外部キー制約を有効化（これを入れないとREFERENCESが機能しません）
+        await conn.execute("PRAGMA foreign_keys = ON") 
 
         # 1. 口座・取引
         await conn.execute("""CREATE TABLE IF NOT EXISTS accounts (
@@ -132,6 +135,10 @@ class BankDatabase:
             balance INTEGER DEFAULT 0 CHECK(balance >= 0), 
             total_earned INTEGER DEFAULT 0
         )""")
+
+        # ▼▼▼ 追加: これがないと「システム(ID:0)」からの送金でエラーになります ▼▼▼
+        await conn.execute("INSERT OR IGNORE INTO accounts (user_id, balance, total_earned) VALUES (0, 0, 0)")
+        # ▲▲▲ ここまで ▲▲▲
 
         await conn.execute("""CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -206,6 +213,26 @@ class BankDatabase:
             )
         """)
         await conn.execute("CREATE TABLE IF NOT EXISTS daily_stats (date TEXT PRIMARY KEY, total_balance INTEGER)")
+
+        # --- 追加: 人間株式市場用のテーブル ---
+        # まだ作成されていない場合に備えてここにも記述しておくと安全です
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS stock_issuers (
+                user_id INTEGER PRIMARY KEY,
+                total_shares INTEGER DEFAULT 0,
+                is_listed INTEGER DEFAULT 1
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS stock_holdings (
+                user_id INTEGER,
+                issuer_id INTEGER,
+                amount INTEGER,
+                avg_cost REAL,
+                PRIMARY KEY (user_id, issuer_id)
+            )
+        """)
+        await conn.execute("CREATE TABLE IF NOT EXISTS market_config (key TEXT PRIMARY KEY, value TEXT)")
 
         await conn.commit()
 
@@ -1387,7 +1414,7 @@ class VoiceHistory(commands.Cog):
             font_main = ImageFont.load_default()
             font_sub = ImageFont.load_default()
 
-        draw.text((40, 40), f"VC STATS: {member.display_name}", fill=(255, 255, 255), font=sub)
+        draw.text((40, 40), f"VC STATS: {member.display_name}", fill=(255, 255, 255), font=font_sub)
         draw.text((40, 100), f"{hours} hours {minutes} mins", fill=(0, 255, 127), font=font_main)
         draw.text((40, 180), f"Total Seconds: {total_seconds:,}s", fill=(185, 187, 190), font=font_sub)
         
