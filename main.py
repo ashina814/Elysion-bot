@@ -3513,12 +3513,31 @@ class CestaBankBot(commands.Bot):
     @tasks.loop(hours=24)
     async def backup_db_task(self):
         import datetime
+        import glob  # ファイル検索用
+        import os    # ファイル削除用
+
+        # 1. 新しいバックアップを作成
         backup_name = f"backup_{datetime.datetime.now().strftime('%Y%m%d')}.db"
         try:
             async with self.get_db() as db:
                 await db.execute(f"VACUUM INTO '{backup_name}'")
             
             logger.info(f"Auto Backup Success: {backup_name}")
+
+            # 2. 古いバックアップを削除 (最新3世代のみ残す)
+            # "backup_*.db" に一致するファイルをすべて取得して、名前順(日付順)に並べる
+            backups = sorted(glob.glob("backup_*.db"))
+            
+            # バックアップが3つより多い場合、古いものから削除する
+            if len(backups) > 3:
+                # リストの「後ろから3つ」を除いたもの（＝古いファイル）を対象にループ
+                for old_bk in backups[:-3]:
+                    try:
+                        os.remove(old_bk) # ファイル削除
+                        logger.info(f"Deleted old backup: {old_bk}")
+                    except Exception as e:
+                        logger.error(f"Failed to delete {old_bk}: {e}")
+
         except Exception as e:
             logger.error(f"Backup Failure: {e}")
 
