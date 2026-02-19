@@ -608,8 +608,7 @@ class TransferConfirmView(discord.ui.View):
         self.stop()
         await interaction.response.edit_message(content="❌ 送金をキャンセルしました。", embed=None, view=None)
 
-
-# --- Cog: Economy (残高・送金) ---
+# --- Cog: Economy (残高・送金・ランキング・資金操作) ---
 class Economy(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -684,6 +683,114 @@ class Economy(commands.Cog):
             )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
+    # === 追加機能1: 所持金ランキング ===
+    @app_commands.command(name="ランキング", description="サーバー内の大富豪トップ10を表示します")
+    async def ranking(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        
+        async with self.bot.get_db() as db:
+            # システムアカウント(ID:0)を除外し、残高が多い順に取得 (退出者やBotを飛ばせるように少し多めに取得)
+            async with db.execute("SELECT user_id, balance FROM accounts WHERE user_id != 0 ORDER BY balance DESC LIMIT 30") as cursor:
+                rows = await cursor.fetchall()
+
+        if not rows:
+            return await interaction.followup.send("まだデータがありません。")
+
+        embed = discord.Embed(title="🏆 ステラ長者番付 トップ10", color=0xFFD700)
+        embed.description = "サーバー内の大富豪ランキングです。\n\n"
+        
+        rank = 1
+        for row in rows:
+            if rank > 10: break
+            
+            member = interaction.guild.get_member(row['user_id'])
+            # 退出済みのメンバーやBotはランキングから除外
+            if not member or member.bot:
+                continue
+            
+            medal = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else f"**{rank}.**"
+            embed.description += f"{medal} **{member.display_name}**\n┗ 💰 **{row['balance']:,} Stell**\n\n"
+            rank += 1
+
+        embed.set_footer(text=f"実行者: {interaction.user.display_name} | Top 10 Richest Citizens")
+        await interaction.followup.send(embed=embed)
+
+    # === 追加機能2: 資金の直接操作 ===
+    @app_commands.command(name="資金操作", description="【最高神】指定したユーザーの所持金を直接増減させます")
+    @app_commands.describe(
+        target="操作対象のユーザー",
+        action="増やすか、減らすか",
+        amount="金額",
+        reason="理由（ログに残ります）"
+    )
+    @app_commands.choices(action=[
+        app_commands.Choice(name="➕ 増やす (Mint)", value="add"),
+        app_commands.Choice(name="➖ 減らす (Burn)", value="remove")
+    ])
+    @has_permission("SUPREME_GOD")
+    async def manipulate_funds(self, interaction: discord.Interaction, target: discord.Member, action: str, amount: int, reason: str = "システム操作"):
+        if amount <= 0:
+            return await interaction.response.send_message("❌ 1以上の金額を指定してください。", ephemeral=True)
+        
+        await interaction.response.defer(ephemeral=True)
+        month_tag = datetime.datetime.now().strftime("%Y-%m")
+
+        async with self.bot.get_db() as db:
+            # 対象の口座が存在しない場合は作成
+            await db.execute("""
+                INSERT INTO accounts (user_id, balance, total_earned) VALUES (?, 0, 0)
+                ON CONFLICT(user_id) DO NOTHING
+            """, (target.id,))
+
+            if action == "add":
+                # 資金追加
+                await db.execute("UPDATE accounts SET balance = balance + ?, total_earned = total_earned + ? WHERE user_id = ?", (amount, amount, target.id))
+                # ログ追加 (システム(0)から対象へ)
+                await db.execute("""
+                    INSERT INTO transactions (sender_id, receiver_id, amount, type, description, month_tag)
+                    VALUES (0, ?, ?, 'SYSTEM_ADD', ?, ?)
+                """, (target.id, amount, f"【運営付与】{reason}", month_tag))
+                msg = f"✅ {target.mention} に **{amount:,} Stell** を付与しました。\n理由: `{reason}`"
+            
+            else:
+                # 資金削減 (現在の残高を取得してマイナスにならないよう調整)
+                async with db.execute("SELECT balance FROM accounts WHERE user_id = ?", (target.id,)) as c:
+                    row = await c.fetchone()
+                    current_bal = row['balance'] if row else 0
+                
+                actual_deduction = min(amount, current_bal)
+                
+                await db.execute("UPDATE accounts SET balance = balance - ? WHERE user_id = ?", (actual_deduction, target.id))
+                # ログ追加 (対象からシステム(0)へ)
+                await db.execute("""
+                    INSERT INTO transactions (sender_id, receiver_id, amount, type, description, month_tag)
+                    VALUES (?, 0, ?, 'SYSTEM_REMOVE', ?, ?)
+                """, (target.id, actual_deduction, f"【運営没収】{reason}", month_tag))
+                
+                msg = f"✅ {target.mention} から **{actual_deduction:,} Stell** を没収しました。\n理由: `{reason}`"
+
+            await db.commit()
+            
+        # 通貨ログチャンネルに通知を送る
+        embed = discord.Embed(title="⚙️ 運営資金操作ログ", color=0xff0000 if action == "remove" else 0x00ff00)
+        embed.add_field(name="対象", value=target.mention, inline=True)
+        embed.add_field(name="操作", value="➕ 付与" if action == "add" else "➖ 没収", inline=True)
+        embed.add_field(name="金額", value=f"**{amount:,} S**" if action == "add" else f"**{actual_deduction:,} S**", inline=True)
+        embed.add_field(name="理由", value=reason, inline=False)
+        embed.add_field(name="実行者", value=interaction.user.mention, inline=False)
+        embed.timestamp = datetime.datetime.now()
+
+        log_ch_id = None
+        async with self.bot.get_db() as db:
+            async with db.execute("SELECT value FROM server_config WHERE key = 'currency_log_id'") as c:
+                row = await c.fetchone()
+                if row: log_ch_id = int(row['value'])
+        if log_ch_id:
+            channel = self.bot.get_channel(log_ch_id)
+            if channel: await channel.send(embed=embed)
+
+        await interaction.followup.send(msg, ephemeral=True)
+
     async def check_admin_permission(self, user):
         if await self.bot.is_owner(user): return True
         user_role_ids = [role.id for role in user.roles]
@@ -692,6 +799,7 @@ class Economy(commands.Cog):
             if r_id in admin_roles and admin_roles[r_id] in ["SUPREME_GOD", "GODDESS"]:
                 return True
         return False
+
 
 class Salary(commands.Cog):
     def __init__(self, bot):
@@ -920,18 +1028,16 @@ class Salary(commands.Cog):
         embed.set_footer(text=f"BatchID: {batch_id}")
         await channel.send(embed=embed)
 
-
 class Jackpot(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.ticket_price = 5000
-        self.sponsor_cut = 0.10
-        self.employee_cut = 0.10
+        self.code_price = 5000
+        self.pool_addition = 3000   # 5000のうち、金庫に入る額
+        self.stella_pocket = 2000   # 5000のうち、消滅する額（インフレ対策）
+        self.stella_tax_rate = 0.20 # 当選時のステラの手数料（20%回収）
         self.limit_per_round = 30
         self.max_number = 999
-        self.seed_money = 1000000
-        self.sponsor_name_display = "滝" 
-        self.employee_role_name = "賭博従者"
+        self.seed_money = 300000    # 初期資金（100万から30万に減額してインフレ抑制）
 
     async def init_db(self):
         async with self.bot.get_db() as db:
@@ -950,100 +1056,101 @@ class Jackpot(commands.Cog):
             """)
             await db.commit()
 
-    @app_commands.command(name="ジャックポット状況", description="現在の賞金総額と自分の番号を確認します")
+    @app_commands.command(name="金庫状況", description="ステラの秘密の金庫の状況と、所持している解除コードを確認します")
     async def status(self, interaction: discord.Interaction):
         await self.init_db()
         
         async with self.bot.get_db() as db:
             async with db.execute("SELECT value FROM server_config WHERE key = 'jackpot_pool'") as c:
                 row = await c.fetchone()
-                pool = int(row['value']) if row else 0
+                pool = int(row['value']) if row else self.seed_money
 
             async with db.execute("SELECT number FROM lottery_tickets WHERE user_id = ? ORDER BY number", (interaction.user.id,)) as c:
-                my_tickets = await c.fetchall()
-                my_numbers = [f"{row['number']:03d}" for row in my_tickets]
+                my_codes = await c.fetchall()
+                my_numbers = [f"{row['number']:03d}" for row in my_codes]
 
             async with db.execute("SELECT COUNT(*) as total FROM lottery_tickets") as c:
                 sold_count = (await c.fetchone())['total']
 
-        embed = discord.Embed(title="🎟️ ステラ・ジャンボ宝くじ", color=0xffd700)
+        embed = discord.Embed(title="🔐 ステラの秘密の金庫", color=0xff00ff)
         embed.description = (
-            "3桁の番号(000-999)が当選番号と一致すれば賞金獲得！\n"
-            "当選者なしの場合、賞金は**全額キャリーオーバー**されます。\n"
+            "「ふふっ、私の裏金庫が気になるの？ どうせあんたたちには開けられないわよ♡」\n\n"
+            "3桁のハッキングコード(000-999)が正解と一致すれば、金庫の中身を強奪！\n"
+            "失敗した場合は**全額キャリーオーバー**されます。\n"
         )
         
-        embed.add_field(name="💰 現在の賞金総額", value=f"**{pool:,} Stell**", inline=False)
-        embed.add_field(name="👑 公認スポンサー", value=f"**{self.sponsor_name_display}** 様", inline=True)
-        embed.add_field(name="🎫 発行済み枚数", value=f"{sold_count:,} 枚", inline=True)
-        embed.add_field(name="📅 当選確率", value="1 / 1000", inline=True)
+        embed.add_field(name="💰 現在の保管額", value=f"**{pool:,} Stell**", inline=False)
+        embed.add_field(name="💻 発行済みコード数", value=f"{sold_count:,} 個", inline=True)
+        embed.add_field(name="📅 ロック解除確率", value="1 / 1000", inline=True)
 
         if my_numbers:
-            ticket_str = ", ".join(my_numbers)
-            if len(ticket_str) > 500: ticket_str = ticket_str[:500] + "..."
-            embed.add_field(name=f"🎫 あなたの番号 ({len(my_numbers)}枚)", value=f"`{ticket_str}`", inline=False)
+            code_str = ", ".join(my_numbers)
+            if len(code_str) > 500: code_str = code_str[:500] + "..."
+            embed.add_field(name=f"🔑 あなたの解除コード ({len(my_numbers)}個)", value=f"`{code_str}`", inline=False)
         else:
-            embed.add_field(name="🎫 あなたの番号", value="未購入", inline=False)
+            embed.add_field(name="🔑 あなたの解除コード", value="未所持", inline=False)
         
-        embed.set_footer(text=f"上限: {self.limit_per_round}枚/人 | 当選時、賞金の10%は従業員に分配されます")
+        embed.set_footer(text=f"コード代({self.code_price}S)のうち、{self.stella_pocket}Sはステラのお小遣いとして消滅します")
         await interaction.response.send_message(embed=embed)
 
-    @app_commands.command(name="ジャックポット購入", description="ランダムな3桁の番号が付与されます (1枚 5,000 Stell)")
-    @app_commands.describe(amount="購入枚数")
+    @app_commands.command(name="ハッキングコード生成", description="金庫の解除コードを生成します (1回 5,000 Stell)")
+    @app_commands.describe(amount="生成回数")
     async def buy(self, interaction: discord.Interaction, amount: int):
-        if amount <= 0: return await interaction.response.send_message("1枚以上指定してください。", ephemeral=True)
+        if amount <= 0: return await interaction.response.send_message("1回以上指定してください。", ephemeral=True)
         
         await interaction.response.defer(ephemeral=True)
         user = interaction.user
-        total_cost = self.ticket_price * amount
+        total_cost = self.code_price * amount
+        total_pool_add = self.pool_addition * amount
+        total_burn = self.stella_pocket * amount
 
         async with self.bot.get_db() as db:
             async with db.execute("SELECT COUNT(*) as count FROM lottery_tickets WHERE user_id = ?", (user.id,)) as c:
                 current_count = (await c.fetchone())['count']
                 if current_count + amount > self.limit_per_round:
-                    return await interaction.followup.send(f"❌ 購入上限です (残り: {self.limit_per_round - current_count}枚)", ephemeral=True)
+                    return await interaction.followup.send(f"ステラ「ちょっと、ガッツきすぎよ！ 上限は {self.limit_per_round}回 までだからね！」\n(残り: {self.limit_per_round - current_count}回)", ephemeral=True)
 
             async with db.execute("SELECT balance FROM accounts WHERE user_id = ?", (user.id,)) as c:
                 row = await c.fetchone()
                 if not row or row['balance'] < total_cost:
-                    return await interaction.followup.send("❌ 資金不足です。", ephemeral=True)
+                    return await interaction.followup.send("ステラ「…お金ないじゃん。貧乏人は帰って。」", ephemeral=True)
 
             try:
-                async with db.execute("SELECT value FROM server_config WHERE key = 'jackpot_sponsor_id'") as c:
-                    s_row = await c.fetchone()
-                    sponsor_id = int(s_row['value']) if s_row else 0
-
+                # ユーザーからお金を引き落とし
                 await db.execute("UPDATE accounts SET balance = balance - ? WHERE user_id = ?", (total_cost, user.id))
                 
-                sponsor_reward = int(total_cost * self.sponsor_cut)
-                if sponsor_id > 0:
-                    await db.execute("UPDATE accounts SET balance = balance + ? WHERE user_id = ?", (sponsor_reward, sponsor_id))
-                
-                to_pool = total_cost - sponsor_reward
+                # プール追加分のみ金庫へ。残りの burn 分はどこにも足さず「消滅（インフレ対策）」させる
                 await db.execute("""
                     INSERT INTO server_config (key, value) VALUES ('jackpot_pool', ?) 
                     ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?
-                """, (to_pool, to_pool))
+                """, (total_pool_add, total_pool_add))
 
-                new_tickets = []
+                new_codes = []
                 my_numbers = []
                 for _ in range(amount):
                     num = random.randint(0, self.max_number)
-                    new_tickets.append((user.id, num))
+                    new_codes.append((user.id, num))
                     my_numbers.append(f"{num:03d}")
                 
-                await db.executemany("INSERT INTO lottery_tickets (user_id, number) VALUES (?, ?)", new_tickets)
+                await db.executemany("INSERT INTO lottery_tickets (user_id, number) VALUES (?, ?)", new_codes)
                 await db.commit()
 
                 num_display = ", ".join(my_numbers)
-                await interaction.followup.send(f"✅ **{amount}枚** 購入しました！\n獲得番号: `{num_display}`\n(売上の10%はスポンサーへ還元されました)", ephemeral=True)
+                msg = (
+                    f"ステラ「はい、ハッキングコードよ。どうせ当たらないんだから無駄遣いね♡\n"
+                    f"（小声）ふふっ、{total_burn:,} Stell は私のお小遣いっと…♪」\n\n"
+                    f"✅ **{amount}個** 生成しました！\n獲得コード: `{num_display}`\n"
+                    f"(購入代金のうち、金庫に **{total_pool_add:,} S** 追加されました)"
+                )
+                await interaction.followup.send(msg, ephemeral=True)
 
             except Exception as e:
                 await db.rollback()
                 traceback.print_exc()
                 await interaction.followup.send("❌ システムエラーが発生しました。", ephemeral=True)
 
-    @app_commands.command(name="ジャックポット抽選", description="【管理者】当選番号を決定します")
-    @app_commands.describe(panic_release="Trueの場合、購入済みチケットから強制的に当選者を選びます")
+    @app_commands.command(name="金庫解除", description="【管理者】金庫のロック解除処理を実行します")
+    @app_commands.describe(panic_release="Trueの場合、発行済みコードの中から強制的に正解を選びます(特大還元祭)")
     @app_commands.default_permissions(administrator=True)
     async def draw(self, interaction: discord.Interaction, panic_release: bool = False):
         await interaction.response.defer()
@@ -1051,11 +1158,8 @@ class Jackpot(commands.Cog):
         async with self.bot.get_db() as db:
             async with db.execute("SELECT value FROM server_config WHERE key = 'jackpot_pool'") as c:
                 row = await c.fetchone()
-                current_pool = int(row['value']) if row else 0
-            
-            async with db.execute("SELECT value FROM server_config WHERE key = 'jackpot_sponsor_id'") as c:
-                s_row = await c.fetchone()
-                sponsor_id = int(s_row['value']) if s_row else 0
+                current_pool = int(row['value']) if row else self.seed_money
+                if current_pool < self.seed_money: current_pool = self.seed_money
 
         winning_number = random.randint(0, self.max_number)
         winners = []
@@ -1065,7 +1169,7 @@ class Jackpot(commands.Cog):
             if panic_release:
                 async with db.execute("SELECT user_id, number FROM lottery_tickets") as c:
                     all_sold = await c.fetchall()
-                if not all_sold: return await interaction.followup.send("⚠️ チケットが売れていません。")
+                if not all_sold: return await interaction.followup.send("⚠️ コードが一つも生成されていません。")
                 
                 is_panic = True
                 lucky = random.choice(all_sold)
@@ -1077,80 +1181,49 @@ class Jackpot(commands.Cog):
 
             winning_str = f"{winning_number:03d}"
             
-            embed = discord.Embed(title="🎰 ステラ・ジャンボ 抽選会", color=0xffd700)
-            embed.add_field(name="🎯 当選番号", value=f"<h1>**{winning_str}**</h1>", inline=False)
+            embed = discord.Embed(title="🚨 ステラ金庫 ハッキング判定", color=0xffd700)
+            embed.add_field(name="🎯 正解コード", value=f"<h1>**{winning_str}**</h1>", inline=False)
 
             if len(winners) > 0:
-                total_employee_reward = int(current_pool * self.employee_cut)
-                winner_pool = current_pool - total_employee_reward
+                # 【インフレ対策】ステラの手数料天引き (消滅するお金)
+                stella_tax = int(current_pool * self.stella_tax_rate)
+                actual_prize_pool = current_pool - stella_tax
                 
-                guild = interaction.guild
-                employee_role = discord.utils.get(guild.roles, name=self.employee_role_name)
-                
-                emp_msg = ""
-                if employee_role and len(employee_role.members) > 0:
-                    pay_per_emp = total_employee_reward // len(employee_role.members)
-                    for member in employee_role.members:
-                        await db.execute("UPDATE accounts SET balance = balance + ? WHERE user_id = ?", (pay_per_emp, member.id))
-                    
-                    emp_msg = f"\n(賞金の10% **{total_employee_reward:,} Stell** が\n従業員 **{len(employee_role.members)}名** に給与として分配されました)"
-                else:
-                    winner_pool += total_employee_reward
-                    emp_msg = "\n(従業員不在のため、カット分は賞金に還元されました)"
-
-                prize_per_winner = winner_pool // len(winners)
+                prize_per_winner = actual_prize_pool // len(winners)
                 winner_mentions = []
                 for w in winners:
                     uid = w['user_id']
                     await db.execute("UPDATE accounts SET balance = balance + ? WHERE user_id = ?", (prize_per_winner, uid))
                     winner_mentions.append(f"<@{uid}>")
                 
-                sponsor_msg = ""
-                if sponsor_id > 0:
-                    await db.execute("UPDATE accounts SET balance = balance - ? WHERE user_id = ?", (self.seed_money, sponsor_id))
-                    await db.execute("UPDATE server_config SET value = ? WHERE key = 'jackpot_pool'", (str(self.seed_money),))
-                    sponsor_msg = f"\n(スポンサー {self.sponsor_name_display} から次回開催費 **{self.seed_money:,} Stell** を徴収しました)"
-                else:
-                    await db.execute("UPDATE server_config SET value = '0' WHERE key = 'jackpot_pool'")
+                # プールを初期資金(30万)にリセット
+                await db.execute("UPDATE server_config SET value = ? WHERE key = 'jackpot_pool'", (str(self.seed_money),))
 
                 await db.execute("DELETE FROM lottery_tickets")
                 await db.commit()
 
-                desc = "キャリーオーバー放出！"
-                if is_panic: desc = "🚨 **パニック・リリース発動！強制放出！** 🚨"
+                desc = f"ステラ「う、嘘でしょ！？ 私の金庫が…開けられた！？\n……し、しょーがないわね。ヘソクリにしてた分 {self.stella_tax_rate*100}%({stella_tax:,} S) は私が頂くから！」"
+                if is_panic: desc = f"ステラ「ちょ、ちょっとシステムエラー！？ なんで勝手に開いてるのよ！！ 泥棒ー！！\nせ、せめて次の競馬代 {self.stella_tax_rate*100}%({stella_tax:,} S) だけでも確保しなきゃ…！」\n🚨 **パニック・リリース発動！強制放出！** 🚨"
                 
-                embed.description = f"🎉 **{len(winners)}名** の当選者が出ました！{desc}"
-                embed.add_field(name="💰 1人あたりの賞金", value=f"**{prize_per_winner:,} Stell** (手取り)", inline=False)
+                embed.description = f"{desc}\n\n🎉 **{len(winners)}名** のハッカーが金庫破りに成功しました！"
+                embed.add_field(name="💰 1人あたりの獲得額", value=f"**{prize_per_winner:,} Stell** (手数料引抜き後)", inline=False)
                 
                 mentions = " ".join(list(set(winner_mentions)))
                 if len(mentions) > 1000: mentions = f"{len(winners)}名の当選者"
-                embed.add_field(name="🏆 当選者一覧", value=mentions, inline=False)
+                embed.add_field(name="🏆 成功者一覧", value=mentions, inline=False)
                 
-                footer = f"おめでとうございます！{sponsor_msg}{emp_msg}"
-                if len(footer) > 2000: footer = footer[:2000] + "..."
-                embed.set_footer(text=footer)
+                embed.set_footer(text=f"金庫の残高はシステムによって{self.seed_money:,} Stellにリセットされました。")
                 embed.color = 0xff00ff 
 
             else:
                 await db.execute("DELETE FROM lottery_tickets")
                 await db.commit()
-                embed.description = "💀 **当選者なし...**"
-                embed.add_field(name="💸 キャリーオーバー", value=f"**{current_pool:,} Stell** は次回に持ち越されます！", inline=False)
+                embed.description = "ステラ「あーっはっは！ ざぁこ♡ 誰一人開けられないじゃない！ このお金はぜーんぶ私のものね！」\n\n💀 **金庫破り失敗...**"
+                embed.add_field(name="💸 キャリーオーバー", value=f"現在の **{current_pool:,} Stell** は次回に持ち越されます！", inline=False)
                 embed.color = 0x2f3136
 
         await interaction.followup.send(content="@everyone", embed=embed)
 
-    @app_commands.command(name="ジャックポット設定", description="スポンサーを設定(売上10%還元 / 当選時100万徴収)")
-    @app_commands.default_permissions(administrator=True)
-    async def set_sponsor(self, interaction: discord.Interaction, user: discord.User):
-        async with self.bot.get_db() as db:
-            await db.execute("""
-                INSERT INTO server_config (key, value) VALUES ('jackpot_sponsor_id', ?)
-                ON CONFLICT(key) DO UPDATE SET value = ?
-            """, (str(user.id), str(user.id)))
-            await db.commit()
-        
-        await interaction.response.send_message(f"✅ ジャックポットのスポンサーを {user.mention} (Tama) に設定しました。\n・チケット売上の**10%**が還元されます。\n・当選者が出た場合、**100万Stell**が徴収されます。", ephemeral=True)
 
 
 # --- 色定義 ---
@@ -1584,10 +1657,10 @@ class Chinchiro(commands.Cog):
             
             # プレイヤー敗北 (メスガキ感〜心配)
             "lose_normal": [ 
-                "はい、没収ー。…その情けない顔、ちょっと好きかも。",
+                "はい、没収ー。叙々苑でもいく？笑。",
                 "ざぁこ♡ …あ、ごめん。本音が。",
                 "…弱すぎ。もっと本気出しなよ。",
-                "あーあ、溶けちゃった。…ドンマイ。"
+                "あーあ、溶けちゃった。どんまーい。"
             ],
             "lose_big": [ 
                 "…うわ、派手に負けたね。…大丈夫？ ご飯食べるお金ある？",
@@ -1724,7 +1797,7 @@ class Chinchiro(commands.Cog):
         if bet < 100: 
             return await interaction.response.send_message("100Stellからにして。小銭じゃつまんないし。", ephemeral=True)
         if bet > self.max_bet:
-            return await interaction.response.send_message(f"…賭けすぎ。上限は **{self.max_bet:,} Stell** まで。…破産されても困るし。", ephemeral=True)
+            return await interaction.response.send_message(f"賭けすぎでしょ、負けたときの事とか考えないわけー？上限は **{self.max_bet:,} Stell** まで。…破産されても困るし。", ephemeral=True)
 
         # 2. 連続プレイ & 湿度管理
         now = datetime.datetime.now()
@@ -1735,7 +1808,7 @@ class Chinchiro(commands.Cog):
             self.play_counts[interaction.user.id] = 0
         
         if last_time and (now - last_time).total_seconds() < 3.0: 
-            return await interaction.response.send_message("…ちょっと、焦りすぎ。落ち着きなよ。", ephemeral=True)
+            return await interaction.response.send_message("ちょっと焦りすぎじゃない？落ち着きなよ。", ephemeral=True)
 
         self.last_played[interaction.user.id] = now
         self.play_counts[interaction.user.id] = self.play_counts.get(interaction.user.id, 0) + 1
@@ -1864,7 +1937,7 @@ class Chinchiro(commands.Cog):
         # 申し込みEmbed
         embed = discord.Embed(title="⚔️ 決闘の申し込み", description=f"{interaction.user.mention} が {opponent.mention} に勝負を挑んだわ。\n\n💰 **レート: {bet:,} Stell**", color=0xff0000)
         embed.set_thumbnail(url=opponent.display_avatar.url)
-        embed.set_footer(text="セスタ「受けるも逃げるも自由よ。…ま、逃げるなんてダサいけど（笑）」")
+        embed.set_footer(text="受けるも逃げるも自由よ。…ま、逃げるなんてダサいけど（笑）")
 
         view = ChinchiroPVPApplyView(self, interaction.user, opponent, bet)
         await interaction.response.send_message(content=opponent.mention, embed=embed, view=view)
@@ -3422,74 +3495,16 @@ class ShopSystem(commands.Cog):
         view = ShopPanelView(self.bot, items, shop_id)
         await interaction.followup.send(embed=embed, view=view)
 
-# --- 3. 管理者ツール (修正版) ---
+# --- 3. 管理者ツール (整理版) ---
 class AdminTools(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-
-    @app_commands.command(name="評価ルート設定", description="評価完了後の「分岐先ロール」と「対応する絵文字」を設定します")
-    @app_commands.describe(
-        slot="設定するスロット番号 (1~5)",
-        role="その絵文字を押した時に付与するロール",
-        emoji="ボタンとして使う絵文字",
-        description="ルートの説明（例: 天使へ）"
-    )
-    @app_commands.choices(slot=[
-        app_commands.Choice(name="スロット1", value=1),
-        app_commands.Choice(name="スロット2", value=2),
-        app_commands.Choice(name="スロット3", value=3),
-        app_commands.Choice(name="スロット4", value=4),
-        app_commands.Choice(name="スロット5", value=5),
-    ])
-    @has_permission("SUPREME_GOD")
-    async def config_eval_branch(self, interaction: discord.Interaction, slot: int, role: discord.Role, emoji: str, description: str):
-        await interaction.response.defer(ephemeral=True)
-        
-        # データベースに保存 (絵文字も保存するように追加)
-        async with self.bot.get_db() as db:
-            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES (?, ?)", (f"branch_{slot}_role", str(role.id)))
-            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES (?, ?)", (f"branch_{slot}_emoji", emoji))
-            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES (?, ?)", (f"branch_{slot}_desc", description))
-            await db.commit()
-            
-        await interaction.followup.send(
-            f"✅ **スロット{slot}** を設定しました。\n"
-            f"ボタン: {emoji}\n"
-            f"ロール: {role.mention}\n"
-            f"説明: {description}", 
-            ephemeral=True
-        )
-
-    @app_commands.command(name="評価ログ設定", description="評価パネルを送信するチャンネルと、剥奪する仮ロールを設定します")
-    @app_commands.describe(
-        channel="パネルを送りたい管理者用チャンネル",
-        probation_role="面接時に付与し、昇格時に削除する仮ロール（研修生など）"
-    )
-    @has_permission("SUPREME_GOD")
-    async def config_eval_base(self, interaction: discord.Interaction, channel: discord.TextChannel, probation_role: discord.Role):
-        await interaction.response.defer(ephemeral=True)
-        
-        async with self.bot.get_db() as db:
-            # チャンネルIDを保存
-            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES ('eval_channel_id', ?)", (str(channel.id),))
-            # 仮ロールIDを保存
-            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES ('probation_role_id', ?)", (str(probation_role.id),))
-            await db.commit()
-            
-        await interaction.followup.send(
-            f"✅ 設定を保存しました。\n"
-            f"・パネル送信先: {channel.mention}\n"
-            f"・仮ロール: {probation_role.mention}\n"
-            f"今後 `/面接通過` を実行すると、パネルはこのチャンネルに送信されます。",
-            ephemeral=True
-        )
 
     @app_commands.command(name="ログ出力先決定", description="各ログの出力先を設定します")
     @app_commands.choices(log_type=[
         discord.app_commands.Choice(name="通貨ログ (送金など)", value="currency_log_id"),
         discord.app_commands.Choice(name="給与ログ (一斉支給)", value="salary_log_id"),
-        discord.app_commands.Choice(name="面接ログ (合格通知)", value="interview_log_id"), # ここにカンマが必要です
-        discord.app_commands.Choice(name="チャット削除ログ", value="chat_log_id")   # これをリストの中に入れます
+        discord.app_commands.Choice(name="面接ログ (合格通知)", value="interview_log_id")
     ])
     @has_permission("SUPREME_GOD")
     async def config_log_channel(self, interaction: discord.Interaction, log_type: str, channel: discord.TextChannel):
@@ -3499,16 +3514,6 @@ class AdminTools(commands.Cog):
             await db.commit()
         await self.bot.config.reload()
         await interaction.followup.send(f"✅ **{channel.mention}** をログ出力先に設定しました。", ephemeral=True)
-        
-    @app_commands.command(name="面接の除外ロール設定", description="面接コマンドでスキップするロール（説明者など）を設定")
-    @has_permission("SUPREME_GOD")
-    async def config_exclude_role(self, interaction: discord.Interaction, role: discord.Role):
-        await interaction.response.defer(ephemeral=True)
-        async with self.bot.get_db() as db:
-            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES ('exclude_role_id', ?)", (str(role.id),))
-            await db.commit()
-        await self.bot.config.reload()
-        await interaction.followup.send(f"✅ 面接時に **{role.name}** を持つメンバーを除外（スキップ）するように設定しました。", ephemeral=True)
 
     @app_commands.command(name="管理者権限設定", description="【オーナー用】管理権限ロールを登録・更新します")
     async def config_set_admin(self, interaction: discord.Interaction, role: discord.Role, level: str):
@@ -3597,73 +3602,235 @@ class AdminTools(commands.Cog):
         await self.bot.config.reload()
         await interaction.followup.send(f"✅ 過去 **{days}日間** に取引がないメンバーを、経済統計から除外するように設定しました。", ephemeral=True)
 
-# --- Cog: MessageLogger (削除ログ) ---
-class MessageLogger(commands.Cog):
-    def __init__(self, bot):
+
+
+# --- 追加: 面接用のUIパネル ---
+class InterviewPanelView(discord.ui.View):
+    def __init__(self, bot, routes, probation_role_id):
+        super().__init__(timeout=None)
         self.bot = bot
+        self.routes = routes
+        self.probation_role_id = probation_role_id
+        self.selected_user = None
 
-    @commands.Cog.listener()
-    async def on_message_delete(self, message):
-        # Botのメッセージや、内容がない（システムメッセージ等）は無視
-        if message.author.bot or not message.guild: return
+        # 対象者を選択するプルダウン
+        self.add_item(InterviewUserSelect())
 
-        # ログ出力先チャンネルを取得
-        log_channel_id = None
-        async with self.bot.get_db() as db:
-            async with db.execute("SELECT value FROM server_config WHERE key = 'chat_log_id'") as c:
-                row = await c.fetchone()
-                if row: log_channel_id = int(row['value'])
+        # 登録されているルートボタンを動的に生成
+        for slot, data in self.routes.items():
+            btn = discord.ui.Button(
+                label=data['desc'],
+                emoji=data['emoji'],
+                style=discord.ButtonStyle.primary,
+                custom_id=f"eval_route_{slot}"
+            )
+            btn.callback = self.make_callback(slot, data)
+            self.add_item(btn)
 
-        if not log_channel_id: return
-        
-        channel = self.bot.get_channel(log_channel_id)
-        if not channel: return
+    def make_callback(self, slot, data):
+        async def callback(interaction: discord.Interaction):
+            if not self.selected_user:
+                return await interaction.response.send_message("❌ 先に上のメニューから対象者(研修生)を選択してください。", ephemeral=True)
 
-        # Embedを作成
-        embed = discord.Embed(title="🗑️ メッセージ削除ログ", color=discord.Color.red(), timestamp=datetime.datetime.now())
-        embed.set_author(name=f"{message.author.display_name} ({message.author.id})", icon_url=message.author.display_avatar.url)
-        embed.add_field(name="場所", value=message.channel.mention, inline=True)
-        
-        # 内容（長すぎる場合は省略）
-        content = message.content
-        if not content: content = "（画像または埋め込みのみ）"
-        if len(content) > 1000: content = content[:1000] + "..."
-        
-        embed.add_field(name="内容", value=content, inline=False)
+            await interaction.response.defer(ephemeral=True)
+            member = interaction.guild.get_member(self.selected_user.id)
+            if not member:
+                return await interaction.followup.send("❌ 対象のユーザーがサーバーに見つかりません。", ephemeral=True)
 
-        # 添付ファイルがあればURLを表示
-        if message.attachments:
-            files = "\n".join([a.url for a in message.attachments])
-            embed.add_field(name="添付ファイル", value=files, inline=False)
+            probation_role = interaction.guild.get_role(self.probation_role_id)
+            new_role = interaction.guild.get_role(data['role_id'])
+            bonus_amount = 30000
+            month_tag = datetime.datetime.now().strftime("%Y-%m")
 
-        await channel.send(embed=embed)
+            try:
+                # ロールの付け替え
+                if probation_role and probation_role in member.roles:
+                    await member.remove_roles(probation_role, reason="面接完了: 仮ロール削除")
+                if new_role:
+                    await member.add_roles(new_role, reason=f"面接完了: {data['desc']}ルート")
+
+                # 祝金の付与
+                async with self.bot.get_db() as db:
+                    await db.execute("""
+                        INSERT INTO accounts (user_id, balance, total_earned) VALUES (?, ?, 0)
+                        ON CONFLICT(user_id) DO UPDATE SET balance = balance + excluded.balance
+                    """, (member.id, bonus_amount))
+                    
+                    await db.execute("""
+                        INSERT INTO transactions (sender_id, receiver_id, amount, type, description, month_tag)
+                        VALUES (0, ?, ?, 'BONUS', ?, ?)
+                    """, (member.id, bonus_amount, f"面接合格: {data['desc']}", month_tag))
+                    await db.commit()
+
+                # ログ送信
+                embed = discord.Embed(title="🌸 面接個別評価 完了", color=discord.Color.gold())
+                embed.add_field(name="対象者", value=member.mention, inline=True)
+                embed.add_field(name="決定ルート", value=f"{data['emoji']} {data['desc']}", inline=True)
+                embed.add_field(name="付与ロール", value=new_role.mention if new_role else "なし", inline=False)
+                embed.add_field(name="祝金", value=f"**{bonus_amount:,} Stell**", inline=False)
+                embed.set_footer(text=f"担当面接官: {interaction.user.display_name}")
+
+                log_ch_id = None
+                async with self.bot.get_db() as db:
+                    async with db.execute("SELECT value FROM server_config WHERE key = 'interview_log_id'") as c:
+                        row = await c.fetchone()
+                        if row: log_ch_id = int(row['value'])
+                
+                if log_ch_id:
+                    log_ch = self.bot.get_channel(log_ch_id)
+                    if log_ch: await log_ch.send(embed=embed)
+
+                await interaction.followup.send(f"✅ **{member.display_name}** を **{data['desc']}** ルートで処理し、祝金を付与しました。", ephemeral=True)
+
+            except Exception as e:
+                logger.error(f"Interview Error: {e}")
+                await interaction.followup.send(f"❌ 処理中にエラーが発生しました: {e}", ephemeral=True)
+
+        return callback
+
+class InterviewUserSelect(discord.ui.UserSelect):
+    def __init__(self):
+        super().__init__(placeholder="1. ここから面接対象者を選択...", min_values=1, max_values=1, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.selected_user = self.values[0]
+        await interaction.response.send_message(f"✅ 対象を **{self.values[0].display_name}** にセットしました。\n2. 決定したルートのボタンを押してください。", ephemeral=True)
 
 
-# --- 修正・追加: InterviewSystem (VC一括処理版) ---
+# --- 修正・統合版: InterviewSystem ---
 class InterviewSystem(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(name="面接合格", description="VC内のメンバーを合格させ、ロール変更と祝金を付与します")
-    @app_commands.describe(
-        target_role="変更前のロール (研修生など)",
-        new_role="変更後のロール (正会員など)"
-    )
+    # --- 1. 面接の基本設定 ---
+    @app_commands.command(name="面接設定_仮ロール", description="【管理者】合格時に剥奪する仮ロール(研修生など)を設定します")
+    @has_permission("SUPREME_GOD")
+    async def config_interview_base(self, interaction: discord.Interaction, probation_role: discord.Role):
+        await interaction.response.defer(ephemeral=True)
+        async with self.bot.get_db() as db:
+            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES ('probation_role_id', ?)", (str(probation_role.id),))
+            await db.commit()
+        await interaction.followup.send(f"✅ 面接の仮ロールを {probation_role.mention} に設定しました。", ephemeral=True)
+
+    @app_commands.command(name="面接設定_ルート", description="【管理者】評価パネルの分岐ルート(1〜5)を設定します")
+    @app_commands.describe(slot="設定枠 (1~5)", role="付与するロール", emoji="ボタンの絵文字", description="ルート名（天使ルート等）")
+    @app_commands.choices(slot=[app_commands.Choice(name=f"ルート {i}", value=i) for i in range(1, 6)])
+    @has_permission("SUPREME_GOD")
+    async def config_eval_branch(self, interaction: discord.Interaction, slot: int, role: discord.Role, emoji: str, description: str):
+        await interaction.response.defer(ephemeral=True)
+        async with self.bot.get_db() as db:
+            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES (?, ?)", (f"branch_{slot}_role", str(role.id)))
+            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES (?, ?)", (f"branch_{slot}_emoji", emoji))
+            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES (?, ?)", (f"branch_{slot}_desc", description))
+            await db.commit()
+        await interaction.followup.send(f"✅ **ルート {slot}** を設定しました。\n{emoji} {description} ➡ {role.mention}", ephemeral=True)
+
+    # --- 2. 除外ロールの管理 (複数対応) ---
+    @app_commands.command(name="面接除外_追加", description="【管理者】VC一括合格の対象から外すロール(面接官など)を追加します")
+    @has_permission("SUPREME_GOD")
+    async def add_exclude_role(self, interaction: discord.Interaction, role: discord.Role):
+        await interaction.response.defer(ephemeral=True)
+        async with self.bot.get_db() as db:
+            async with db.execute("SELECT value FROM server_config WHERE key = 'interview_exclude_roles'") as c:
+                row = await c.fetchone()
+                current = row['value'].split(',') if row and row['value'] else []
+            
+            if str(role.id) not in current:
+                current.append(str(role.id))
+                await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES ('interview_exclude_roles', ?)", (','.join(current),))
+                await db.commit()
+                await interaction.followup.send(f"✅ {role.mention} を除外ロールに追加しました。", ephemeral=True)
+            else:
+                await interaction.followup.send(f"⚠️ {role.mention} は既に除外ロールに登録されています。", ephemeral=True)
+
+    @app_commands.command(name="面接除外_削除", description="【管理者】登録されている除外ロールを解除します")
+    @has_permission("SUPREME_GOD")
+    async def remove_exclude_role(self, interaction: discord.Interaction, role: discord.Role):
+        await interaction.response.defer(ephemeral=True)
+        async with self.bot.get_db() as db:
+            async with db.execute("SELECT value FROM server_config WHERE key = 'interview_exclude_roles'") as c:
+                row = await c.fetchone()
+                current = row['value'].split(',') if row and row['value'] else []
+            
+            if str(role.id) in current:
+                current.remove(str(role.id))
+                await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES ('interview_exclude_roles', ?)", (','.join(current),))
+                await db.commit()
+                await interaction.followup.send(f"🗑️ {role.mention} を除外ロールから削除しました。", ephemeral=True)
+            else:
+                await interaction.followup.send(f"⚠️ {role.mention} は除外ロールに登録されていません。", ephemeral=True)
+
+    @app_commands.command(name="面接除外_一覧", description="【管理者】現在登録されている除外ロールの一覧を確認します")
+    @has_permission("ADMIN")
+    async def list_exclude_roles(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        async with self.bot.get_db() as db:
+            async with db.execute("SELECT value FROM server_config WHERE key = 'interview_exclude_roles'") as c:
+                row = await c.fetchone()
+                current = row['value'].split(',') if row and row['value'] else []
+
+        if not current:
+            return await interaction.followup.send("📝 除外ロールは登録されていません。", ephemeral=True)
+
+        mentions = [f"<@&{role_id}>" for role_id in current]
+        embed = discord.Embed(title="🛡️ 面接除外ロール一覧", description="\n".join(mentions), color=discord.Color.blue())
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    # --- 3. 評価パネルの展開 ---
+    @app_commands.command(name="面接パネル設置", description="【管理者】個別にルート分岐させるための評価操作パネルを設置します")
+    @has_permission("ADMIN")
+    async def deploy_interview_panel(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
+        routes = {}
+        probation_role_id = None
+
+        async with self.bot.get_db() as db:
+            async with db.execute("SELECT value FROM server_config WHERE key = 'probation_role_id'") as c:
+                row = await c.fetchone()
+                if row: probation_role_id = int(row['value'])
+
+            for i in range(1, 6):
+                async with db.execute("SELECT key, value FROM server_config WHERE key LIKE ?", (f"branch_{i}_%",)) as c:
+                    rows = await c.fetchall()
+                    data = {}
+                    for r in rows:
+                        if r['key'].endswith('_role'): data['role_id'] = int(r['value'])
+                        elif r['key'].endswith('_emoji'): data['emoji'] = r['value']
+                        elif r['key'].endswith('_desc'): data['desc'] = r['value']
+                    
+                    if 'role_id' in data and 'emoji' in data and 'desc' in data:
+                        routes[i] = data
+
+        if not routes:
+            return await interaction.followup.send("❌ ルートが1つも設定されていません。先に `/面接設定_ルート` で設定を行ってください。", ephemeral=True)
+        if not probation_role_id:
+            return await interaction.followup.send("❌ 仮ロール（研修生）が設定されていません。先に `/面接設定_仮ロール` で設定を行ってください。", ephemeral=True)
+
+        embed = discord.Embed(title="📋 面接評価パネル", description="1. メニューから対象者を選択してください。\n2. 決定した評価ルートのボタンを押してください。\n\n※自動でロールの付け替えと **30,000 Stell** の祝金が付与されます。", color=0x2b2d31)
+        view = InterviewPanelView(self.bot, routes, probation_role_id)
+        
+        await interaction.channel.send(embed=embed, view=view)
+        await interaction.followup.send("✅ パネルを設置しました。", ephemeral=True)
+
+    # --- 4. 既存のVC一括処理 (複数除外ロール対応版) ---
+    @app_commands.command(name="面接_vc一括合格", description="【管理者】現在いるVCメンバー全員を一括で合格処理します")
+    @app_commands.describe(target_role="変更前のロール(研修生)", new_role="変更後のロール(正会員)")
     @has_permission("ADMIN")
     async def pass_interview_vc(self, interaction: discord.Interaction, target_role: discord.Role, new_role: discord.Role):
-        # 1. VCに参加しているか確認
         if not interaction.user.voice or not interaction.user.voice.channel:
             return await interaction.response.send_message("❌ VCに参加してから実行してください。", ephemeral=True)
         
         channel = interaction.user.voice.channel
         await interaction.response.defer()
 
-        # 2. 除外ロールIDを取得
-        exclude_role_id = None
+        # 複数登録された除外ロールを読み込む
+        exclude_roles = []
         async with self.bot.get_db() as db:
-            async with db.execute("SELECT value FROM server_config WHERE key = 'exclude_role_id'") as c:
+            async with db.execute("SELECT value FROM server_config WHERE key = 'interview_exclude_roles'") as c:
                 row = await c.fetchone()
-                if row: exclude_role_id = int(row['value'])
+                if row and row['value']:
+                    exclude_roles = [int(x) for x in row['value'].split(',')]
 
         processed_count = 0
         bonus_amount = 30000
@@ -3672,50 +3839,35 @@ class InterviewSystem(commands.Cog):
 
         async with self.bot.get_db() as db:
             for member in channel.members:
-                # Botはスキップ
                 if member.bot: continue
-
-                # 除外ロールを持っている場合はスキップ
-                if exclude_role_id:
-                    # ロールIDリストの中に exclude_role_id があるか確認
-                    if any(r.id == exclude_role_id for r in member.roles):
-                        continue
-                
-                # ターゲットロールを持っていない場合はスキップ（安全策）
-                if target_role not in member.roles:
-                    continue
+                # 複数の除外ロールのいずれかを持っていたらスキップ
+                if any(r.id in exclude_roles for r in member.roles): continue
+                if target_role not in member.roles: continue
 
                 try:
-                    # ロール変更処理
-                    await member.remove_roles(target_role, reason="面接合格: 旧ロール削除")
-                    await member.add_roles(new_role, reason="面接合格: 新ロール付与")
+                    await member.remove_roles(target_role, reason="面接一括合格: 旧ロール削除")
+                    await member.add_roles(new_role, reason="面接一括合格: 新ロール付与")
                     
-                    # 祝金付与処理 (30,000 Stell)
-                    # 口座作成or更新
                     await db.execute("""
                         INSERT INTO accounts (user_id, balance, total_earned) VALUES (?, ?, 0)
                         ON CONFLICT(user_id) DO UPDATE SET balance = balance + excluded.balance
                     """, (member.id, bonus_amount))
                     
-                    # 取引履歴作成
                     await db.execute("""
                         INSERT INTO transactions (sender_id, receiver_id, amount, type, description, month_tag)
-                        VALUES (0, ?, ?, 'BONUS', '面接合格祝い', ?)
+                        VALUES (0, ?, ?, 'BONUS', '面接一括合格祝い', ?)
                     """, (member.id, bonus_amount, month_tag))
                     
                     processed_count += 1
                     processed_members.append(member.display_name)
                     
-                except discord.Forbidden:
-                    logger.error(f"Failed to change roles for {member.display_name}: Forbidden")
                 except Exception as e:
                     logger.error(f"Error processing interview pass for {member.display_name}: {e}")
 
             await db.commit()
 
-        # 結果報告
         if processed_count > 0:
-            embed = discord.Embed(title="🌸 面接合格処理完了", color=discord.Color.brand_green())
+            embed = discord.Embed(title="🌸 面接一括合格処理 完了", color=discord.Color.brand_green())
             embed.add_field(name="処理人数", value=f"{processed_count} 名", inline=False)
             embed.add_field(name="ロール変更", value=f"{target_role.mention} ➡ {new_role.mention}", inline=False)
             embed.add_field(name="付与ボーナス", value=f"**{bonus_amount:,} Stell** / 人", inline=False)
@@ -3726,7 +3878,6 @@ class InterviewSystem(commands.Cog):
             
             await interaction.followup.send(embed=embed)
             
-            # ログ出力用チャンネルにも送信
             log_ch_id = None
             async with self.bot.get_db() as db:
                 async with db.execute("SELECT value FROM server_config WHERE key = 'interview_log_id'") as c:
@@ -3735,10 +3886,9 @@ class InterviewSystem(commands.Cog):
             
             if log_ch_id:
                 log_ch = self.bot.get_channel(log_ch_id)
-                if log_ch:
-                    await log_ch.send(embed=embed)
+                if log_ch: await log_ch.send(embed=embed)
         else:
-            await interaction.followup.send("⚠️ 処理対象となるメンバーがいませんでした。\n(除外ロール所持者や、対象ロールを持っていないメンバーはスキップされます)", ephemeral=True)
+            await interaction.followup.send("⚠️ 対象となるメンバーがいませんでした。\n(除外ロール所持者や、対象ロールを持っていないメンバーはスキップされます)", ephemeral=True)
 
 
 # --- Bot 本体 ---
@@ -3798,7 +3948,6 @@ class CestaBankBot(commands.Bot):
         await self.add_cog(ShopSystem(self))
         await self.add_cog(HumanStockMarket(self))
 
-        await self.add_cog(MessageLogger(self))
         await self.add_cog(VoiceSystem(self))
         await self.add_cog(PrivateVCManager(self))
         await self.add_cog(VoiceHistory(self))
