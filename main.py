@@ -3688,31 +3688,28 @@ class InterviewPanelView(discord.ui.View):
 
         return callback
 
-class InterviewUserSelect(discord.ui.UserSelect):
-    def __init__(self):
-        super().__init__(placeholder="1. ここから面接対象者を選択...", min_values=1, max_values=1, row=0)
+# --- Cog: InterviewSystem (2段階評価システム) ---
+class DynamicEvalView(discord.ui.View):
+    def __init__(self, user_id, base_role_id, routes):
+        super().__init__(timeout=None) # タイムアウトなしで2週間後でも押せるようにする
+        
+        # データベースに登録されているルートの数だけボタンを生成
+        for slot, data in routes.items():
+            btn = discord.ui.Button(
+                label=data['desc'],
+                emoji=data['emoji'],
+                style=discord.ButtonStyle.primary,
+                # custom_id に「ユーザーID」「剥奪する旧ロールID」「付与する新ロールID」を埋め込む（再起動対策）
+                custom_id=f"eval_route:{user_id}:{base_role_id}:{data['role_id']}"
+            )
+            self.add_item(btn)
 
-    async def callback(self, interaction: discord.Interaction):
-        self.view.selected_user = self.values[0]
-        await interaction.response.send_message(f"✅ 対象を **{self.values[0].display_name}** にセットしました。\n2. 決定したルートのボタンを押してください。", ephemeral=True)
-
-
-# --- 修正・統合版: InterviewSystem ---
 class InterviewSystem(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
     # --- 1. 面接の基本設定 ---
-    @app_commands.command(name="面接設定_仮ロール", description="【管理者】合格時に剥奪する仮ロール(研修生など)を設定します")
-    @has_permission("SUPREME_GOD")
-    async def config_interview_base(self, interaction: discord.Interaction, probation_role: discord.Role):
-        await interaction.response.defer(ephemeral=True)
-        async with self.bot.get_db() as db:
-            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES ('probation_role_id', ?)", (str(probation_role.id),))
-            await db.commit()
-        await interaction.followup.send(f"✅ 面接の仮ロールを {probation_role.mention} に設定しました。", ephemeral=True)
-
-    @app_commands.command(name="面接設定_ルート", description="【管理者】評価パネルの分岐ルート(1〜5)を設定します")
+    @app_commands.command(name="面接設定_ルート", description="【管理者】2週間後の評価分岐ルート(1〜5)を設定します")
     @app_commands.describe(slot="設定枠 (1~5)", role="付与するロール", emoji="ボタンの絵文字", description="ルート名（天使ルート等）")
     @app_commands.choices(slot=[app_commands.Choice(name=f"ルート {i}", value=i) for i in range(1, 6)])
     @has_permission("SUPREME_GOD")
@@ -3724,6 +3721,15 @@ class InterviewSystem(commands.Cog):
             await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES (?, ?)", (f"branch_{slot}_desc", description))
             await db.commit()
         await interaction.followup.send(f"✅ **ルート {slot}** を設定しました。\n{emoji} {description} ➡ {role.mention}", ephemeral=True)
+
+    @app_commands.command(name="評価パネル送信先設定", description="【管理者】VC面接通過後、2週間後の評価パネルを送るチャンネルを設定します")
+    @has_permission("SUPREME_GOD")
+    async def config_eval_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        await interaction.response.defer(ephemeral=True)
+        async with self.bot.get_db() as db:
+            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES ('eval_channel_id', ?)", (str(channel.id),))
+            await db.commit()
+        await interaction.followup.send(f"✅ VC面接通過後の「評価待ちパネル」を {channel.mention} に送信するよう設定しました。", ephemeral=True)
 
     # --- 2. 除外ロールの管理 (複数対応) ---
     @app_commands.command(name="面接除外_追加", description="【管理者】VC一括合格の対象から外すロール(面接官など)を追加します")
@@ -3776,19 +3782,31 @@ class InterviewSystem(commands.Cog):
         embed = discord.Embed(title="🛡️ 面接除外ロール一覧", description="\n".join(mentions), color=discord.Color.blue())
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    # --- 3. 評価パネルの展開 ---
-    @app_commands.command(name="面接パネル設置", description="【管理者】個別にルート分岐させるための評価操作パネルを設置します")
-    @has_permission("ADMIN")
-    async def deploy_interview_panel(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        
-        routes = {}
-        probation_role_id = None
 
+    # --- 3. 実行コマンド: VC一括面接 (Phase 1) ---
+    @app_commands.command(name="面接_vc一括合格", description="【管理者】VC内の対象者を合格させ、2週間後の評価パネルを自動生成します")
+    @app_commands.describe(target_role="変更前のロール(Aロール)", new_role="変更後のロール(Bロール)")
+    @has_permission("ADMIN")
+    async def pass_interview_vc(self, interaction: discord.Interaction, target_role: discord.Role, new_role: discord.Role):
+        if not interaction.user.voice or not interaction.user.voice.channel:
+            return await interaction.response.send_message("❌ VCに参加してから実行してください。", ephemeral=True)
+        
+        channel = interaction.user.voice.channel
+        await interaction.response.defer(ephemeral=True) # ★自分だけに表示
+
+        exclude_roles = []
+        eval_channel_id = None
+        routes = {}
+
+        # DBから設定を読み込む
         async with self.bot.get_db() as db:
-            async with db.execute("SELECT value FROM server_config WHERE key = 'probation_role_id'") as c:
+            async with db.execute("SELECT value FROM server_config WHERE key = 'interview_exclude_roles'") as c:
                 row = await c.fetchone()
-                if row: probation_role_id = int(row['value'])
+                if row and row['value']: exclude_roles = [int(x) for x in row['value'].split(',')]
+            
+            async with db.execute("SELECT value FROM server_config WHERE key = 'eval_channel_id'") as c:
+                row = await c.fetchone()
+                if row: eval_channel_id = int(row['value'])
 
             for i in range(1, 6):
                 async with db.execute("SELECT key, value FROM server_config WHERE key LIKE ?", (f"branch_{i}_%",)) as c:
@@ -3798,55 +3816,22 @@ class InterviewSystem(commands.Cog):
                         if r['key'].endswith('_role'): data['role_id'] = int(r['value'])
                         elif r['key'].endswith('_emoji'): data['emoji'] = r['value']
                         elif r['key'].endswith('_desc'): data['desc'] = r['value']
-                    
-                    if 'role_id' in data and 'emoji' in data and 'desc' in data:
-                        routes[i] = data
+                    if 'role_id' in data: routes[i] = data
 
-        if not routes:
-            return await interaction.followup.send("❌ ルートが1つも設定されていません。先に `/面接設定_ルート` で設定を行ってください。", ephemeral=True)
-        if not probation_role_id:
-            return await interaction.followup.send("❌ 仮ロール（研修生）が設定されていません。先に `/面接設定_仮ロール` で設定を行ってください。", ephemeral=True)
-
-        embed = discord.Embed(title="📋 面接評価パネル", description="1. メニューから対象者を選択してください。\n2. 決定した評価ルートのボタンを押してください。\n\n※自動でロールの付け替えと **30,000 Stell** の祝金が付与されます。", color=0x2b2d31)
-        view = InterviewPanelView(self.bot, routes, probation_role_id)
-        
-        await interaction.channel.send(embed=embed, view=view)
-        await interaction.followup.send("✅ パネルを設置しました。", ephemeral=True)
-
-    # --- 4. 既存のVC一括処理 (複数除外ロール対応版) ---
-    @app_commands.command(name="面接_vc一括合格", description="【管理者】現在いるVCメンバー全員を一括で合格処理します")
-    @app_commands.describe(target_role="変更前のロール(研修生)", new_role="変更後のロール(正会員)")
-    @has_permission("ADMIN")
-    async def pass_interview_vc(self, interaction: discord.Interaction, target_role: discord.Role, new_role: discord.Role):
-        if not interaction.user.voice or not interaction.user.voice.channel:
-            return await interaction.response.send_message("❌ VCに参加してから実行してください。", ephemeral=True)
-        
-        channel = interaction.user.voice.channel
-        await interaction.response.defer()
-
-        # 複数登録された除外ロールを読み込む
-        exclude_roles = []
-        async with self.bot.get_db() as db:
-            async with db.execute("SELECT value FROM server_config WHERE key = 'interview_exclude_roles'") as c:
-                row = await c.fetchone()
-                if row and row['value']:
-                    exclude_roles = [int(x) for x in row['value'].split(',')]
-
-        processed_count = 0
-        bonus_amount = 30000
         processed_members = []
+        bonus_amount = 30000
         month_tag = datetime.datetime.now().strftime("%Y-%m")
 
+        # 対象者のロール付け替えと祝金付与
         async with self.bot.get_db() as db:
             for member in channel.members:
                 if member.bot: continue
-                # 複数の除外ロールのいずれかを持っていたらスキップ
                 if any(r.id in exclude_roles for r in member.roles): continue
                 if target_role not in member.roles: continue
 
                 try:
-                    await member.remove_roles(target_role, reason="面接一括合格: 旧ロール削除")
-                    await member.add_roles(new_role, reason="面接一括合格: 新ロール付与")
+                    await member.remove_roles(target_role, reason="面接一括合格: Aロール削除")
+                    await member.add_roles(new_role, reason="面接一括合格: Bロール付与")
                     
                     await db.execute("""
                         INSERT INTO accounts (user_id, balance, total_earned) VALUES (?, ?, 0)
@@ -3858,37 +3843,84 @@ class InterviewSystem(commands.Cog):
                         VALUES (0, ?, ?, 'BONUS', '面接一括合格祝い', ?)
                     """, (member.id, bonus_amount, month_tag))
                     
-                    processed_count += 1
-                    processed_members.append(member.display_name)
-                    
+                    processed_members.append(member)
                 except Exception as e:
-                    logger.error(f"Error processing interview pass for {member.display_name}: {e}")
-
+                    logger.error(f"Interview Error: {e}")
             await db.commit()
 
-        if processed_count > 0:
-            embed = discord.Embed(title="🌸 面接一括合格処理 完了", color=discord.Color.brand_green())
-            embed.add_field(name="処理人数", value=f"{processed_count} 名", inline=False)
-            embed.add_field(name="ロール変更", value=f"{target_role.mention} ➡ {new_role.mention}", inline=False)
-            embed.add_field(name="付与ボーナス", value=f"**{bonus_amount:,} Stell** / 人", inline=False)
+        if not processed_members:
+            return await interaction.followup.send("⚠️ 対象となるメンバーがいませんでした。", ephemeral=True)
+
+        # 実行者(自分)への結果報告（Ephemeral）
+        embed = discord.Embed(title="🌸 VC面接 合格処理完了", color=discord.Color.brand_green())
+        embed.add_field(name="処理人数", value=f"{len(processed_members)} 名", inline=False)
+        embed.add_field(name="ロール変更", value=f"{target_role.mention} ➡ {new_role.mention}", inline=False)
+        names = ", ".join([m.display_name for m in processed_members])
+        embed.add_field(name="対象者", value=names[:1000], inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+        # 指定チャンネルへ評価パネル(備忘録)を送信
+        if eval_channel_id and routes:
+            eval_ch = self.bot.get_channel(eval_channel_id)
+            if eval_ch:
+                for member in processed_members:
+                    view = DynamicEvalView(member.id, new_role.id, routes)
+                    msg_embed = discord.Embed(
+                        title=f"📋 評価待ち: {member.display_name}", 
+                        description=f"現在のロール: {new_role.mention}\n2週間後、決定したルートのボタンを押してください。",
+                        color=0x2b2d31
+                    )
+                    msg_embed.set_thumbnail(url=member.display_avatar.url)
+                    await eval_ch.send(content=f"{member.mention}", embed=msg_embed, view=view)
+
+
+    # --- 4. ボタンが押された時の処理 (Phase 2: 2週間後の評価) ---
+    @commands.Cog.listener()
+    async def on_interaction(self, interaction: discord.Interaction):
+        # コンポーネント(ボタン)じゃなければ無視
+        if interaction.type != discord.InteractionType.component: return
+        
+        custom_id = interaction.data.get("custom_id", "")
+        # 面接の評価ボタンじゃなければ無視
+        if not custom_id.startswith("eval_route:"): return
+
+        # eval_route:{user_id}:{base_role_id}:{new_role_id} の形式で情報を抽出
+        parts = custom_id.split(":")
+        if len(parts) != 4: return
+        
+        target_id = int(parts[1])
+        base_role_id = int(parts[2])
+        new_role_id = int(parts[3])
+
+        await interaction.response.defer(ephemeral=True)
+
+        member = interaction.guild.get_member(target_id)
+        if not member:
+            return await interaction.followup.send("❌ ユーザーが既にサーバーにいないようです。", ephemeral=True)
+
+        base_role = interaction.guild.get_role(base_role_id)
+        new_role = interaction.guild.get_role(new_role_id)
+
+        try:
+            # ロールの付け替え (Bロールを剥奪して、C/Dロールを付与)
+            if base_role and base_role in member.roles:
+                await member.remove_roles(base_role, reason="2週間評価: Bロール剥奪")
+            if new_role:
+                await member.add_roles(new_role, reason="2週間評価: ルート確定ロール付与")
+
+            # 押したボタンのあるメッセージを更新(ボタンを消して完了済みにする)
+            completed_embed = interaction.message.embeds[0]
+            completed_embed.color = discord.Color.gold()
+            completed_embed.title = f"✅ 評価完了: {member.display_name}"
+            completed_embed.description = f"決定ルート: {new_role.mention if new_role else '不明'}\n担当: {interaction.user.display_name}"
             
-            members_text = ", ".join(processed_members)
-            if len(members_text) > 1000: members_text = members_text[:1000] + "..."
-            embed.add_field(name="対象者", value=members_text, inline=False)
-            
-            await interaction.followup.send(embed=embed)
-            
-            log_ch_id = None
-            async with self.bot.get_db() as db:
-                async with db.execute("SELECT value FROM server_config WHERE key = 'interview_log_id'") as c:
-                    row = await c.fetchone()
-                    if row: log_ch_id = int(row['value'])
-            
-            if log_ch_id:
-                log_ch = self.bot.get_channel(log_ch_id)
-                if log_ch: await log_ch.send(embed=embed)
-        else:
-            await interaction.followup.send("⚠️ 対象となるメンバーがいませんでした。\n(除外ロール所持者や、対象ロールを持っていないメンバーはスキップされます)", ephemeral=True)
+            # ビューを空にしてメッセージを更新
+            await interaction.message.edit(embed=completed_embed, view=None)
+            await interaction.followup.send(f"✅ {member.display_name} の評価を完了し、ロールを更新しました。", ephemeral=True)
+
+        except Exception as e:
+            logger.error(f"Eval Error: {e}")
+            await interaction.followup.send("❌ ロールの変更中にエラーが発生しました。権限などを確認してください。", ephemeral=True)
 
 
 # --- Bot 本体 ---
