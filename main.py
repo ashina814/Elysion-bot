@@ -163,10 +163,21 @@ class BankDatabase:
             dm_salary_enabled INTEGER DEFAULT 1
         )""")
 
-        # 3. VC関連
-        await conn.execute("CREATE TABLE IF NOT EXISTS voice_stats (user_id INTEGER PRIMARY KEY, total_seconds INTEGER DEFAULT 0)")
+                # 3. VC関連
+        # ▼ 古い形式のテーブルを一度削除して作り直す（★起動確認後はここに # をつけて無効化！）
+       # await conn.execute("DROP TABLE IF EXISTS voice_stats")
+        
+        # ▼ 月間対応の新しいテーブルを作成
+        await conn.execute("""CREATE TABLE IF NOT EXISTS voice_stats (
+            user_id INTEGER, 
+            month TEXT, 
+            total_seconds INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, month)
+        )""")
+        
         await conn.execute("CREATE TABLE IF NOT EXISTS voice_tracking (user_id INTEGER PRIMARY KEY, join_time TEXT)")
         
+        # ▼ 抜け落ちていた部分（元のまま残します）
         await conn.execute("""CREATE TABLE IF NOT EXISTS temp_vcs (
             channel_id INTEGER PRIMARY KEY,
             guild_id INTEGER,
@@ -235,6 +246,7 @@ class BankDatabase:
         await conn.execute("CREATE TABLE IF NOT EXISTS market_config (key TEXT PRIMARY KEY, value TEXT)")
 
         await conn.commit()
+
 
     
 # --- UI: VC内操作パネル  ---
@@ -1418,6 +1430,9 @@ class VoiceSystem(commands.Cog):
                     if reward > 0:
                         month_tag = now.strftime("%Y-%m")
                         
+                    if reward > 0:
+                        month_tag = now.strftime("%Y-%m")
+                        
                         await db.execute("INSERT OR IGNORE INTO accounts (user_id, balance, total_earned) VALUES (0, 0, 0)")
                         await db.execute("INSERT OR IGNORE INTO accounts (user_id, balance, total_earned) VALUES (?, 0, 0)", (user_id,))
                         
@@ -1425,24 +1440,20 @@ class VoiceSystem(commands.Cog):
                             "UPDATE accounts SET balance = balance +?, total_earned = total_earned +? WHERE user_id =?", 
                             (reward, reward, user_id)
                         )
-                        await db.execute("INSERT OR IGNORE INTO voice_stats (user_id) VALUES (?)", (user_id,))
-                        await db.execute("UPDATE voice_stats SET total_seconds = total_seconds +? WHERE user_id =?", (sec, user_id))
                         
+                        # ▼▼ ここから ▼▼
                         await db.execute(
-                            "INSERT INTO transactions (sender_id, receiver_id, amount, type, description, month_tag) VALUES (0, ?, ?, 'VC_REWARD', 'VC活動報酬', ?)",
-                            (user_id, reward, month_tag)
+                            "INSERT OR IGNORE INTO voice_stats (user_id, month, total_seconds) VALUES (?, ?, 0)", 
+                            (user_id, month_tag)
                         )
-                    
-                    await db.execute("DELETE FROM voice_tracking WHERE user_id =?", (user_id,))
-                    await db.commit()
+                        await db.execute(
+                            "UPDATE voice_stats SET total_seconds = total_seconds + ? WHERE user_id = ? AND month = ?", 
+                            (sec, user_id, month_tag)
+                        )
+                        # ▲▲ ここまで ▲▲
 
-                    if reward > 0:
-                        embed = discord.Embed(title="🎙 VC報酬精算", color=discord.Color.blue(), timestamp=now)
-                        embed.add_field(name="ユーザー", value=f"<@{user_id}>")
-                        embed.add_field(name="付与額", value=f"{reward:,} S")
-                        embed.add_field(name="レート", value=f"{self.reward_rate} S/min", inline=True) # レートもログに残す
-                        embed.add_field(name="滞在時間", value=f"{sec // 60}分")
-                        await self.bot.send_bank_log('currency_log_id', embed)
+                        await db.execute(
+
 
                 except Exception as db_err:
                     await db.rollback()
@@ -1458,19 +1469,25 @@ class VoiceSystem(commands.Cog):
         self.is_ready_processed = True
         await self.reload_targets()
         
-
 class VoiceHistory(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(name="vc記録", description="指定したユーザーのVC累計滞在時間を画像で表示します")
+    @app_commands.command(name="vc記録", description="指定したユーザーの【今月の】VC累計滞在時間を画像で表示します")
     @app_commands.describe(member="確認したいユーザー")
     @has_permission("GODDESS")
     async def vc_history(self, interaction: discord.Interaction, member: discord.Member):
         await interaction.response.defer()
 
+        # 今月の年月タグを取得 (例: "2026-02")
+        current_month = datetime.datetime.now().strftime("%Y-%m")
+
         async with self.bot.get_db() as db:
-            async with db.execute("SELECT total_seconds FROM voice_stats WHERE user_id = ?", (member.id,)) as cursor:
+            # WHERE に month = current_month を追加して、今月のデータだけを取得
+            async with db.execute(
+                "SELECT total_seconds FROM voice_stats WHERE user_id = ? AND month = ?", 
+                (member.id, current_month)
+            ) as cursor:
                 row = await cursor.fetchone()
                 total_seconds = row['total_seconds'] if row else 0
 
@@ -1499,11 +1516,13 @@ class VoiceHistory(commands.Cog):
         
         file = discord.File(fp=img_byte_arr, filename=f"vc_stats_{member.id}.png")
         
-        embed = discord.Embed(title="📊 VC滞在記録照会", color=0x7289da)
+        # タイトルにも月を入れておくと親切です
+        embed = discord.Embed(title=f"📊 VC滞在記録照会 ({current_month})", color=0x7289da)
         embed.set_image(url=f"attachment://vc_stats_{member.id}.png")
         embed.set_footer(text=f"Requested by {interaction.user.display_name}")
         
         await interaction.followup.send(embed=embed, file=file)
+
 
 
 
@@ -2974,154 +2993,99 @@ class HumanStockMarket(commands.Cog):
         embed.set_footer(text="株を買うと価格が上がり、売ると下がります。推しをスターに押し上げよう！")
         await interaction.followup.send(embed=embed)
 
+import io
+import datetime
+import matplotlib.pyplot as plt
+import japanize_matplotlib # 日本語を表示するために必須です！
 
-
-
-# グラフ描画関数をクラスの外（または静的メソッド）に出し、同期関数として定義します
 def generate_economy_dashboard(balances, history, flow_stats, type_breakdown, total_asset, avg_asset, active_citizens, active_days):
     """
-    重い描画処理を行う関数（別スレッドで実行される）
+    見やすさ重視・日本語解説付きの縦長ダッシュボード
     """
     plt.style.use('dark_background')
     
-    # キャンバスサイズを横長にしてダッシュボード感を出す
-    fig = plt.figure(figsize=(20, 9))
-    gs = fig.add_gridspec(2, 3) # 2行3列のグリッド
+    # スマホ・Discordでそのまま読める縦長レイアウト
+    fig = plt.figure(figsize=(10, 15))
+    gs = fig.add_gridspec(3, 1, height_ratios=[1.2, 1.2, 1.0])
 
-    # --- 1. 左エリア: マクロ経済推移 ---
-    ax1 = fig.add_subplot(gs[0, 0]) # 資産推移
-    dates = [r['date'][5:] for r in history]
-    totals = [r['total_balance'] for r in history]
-    ax1.plot(dates, totals, marker='o', color='#00d2ff', linewidth=2.5)
-    ax1.fill_between(dates, totals, color='#00d2ff', alpha=0.1)
-    ax1.set_title(f"Money Supply Trend (Total: {total_asset:,} S)", fontweight='bold', color='white')
+    # --- 1. 上段: マクロ経済推移 ---
+    ax1 = fig.add_subplot(gs[0])
+    try:
+        dates = [r['date'][5:] for r in history]
+        totals = [r['total_balance'] for r in history]
+    except TypeError:
+        dates = [r[0][5:] for r in history]
+        totals = [r[1] for r in history]
+
+    ax1.plot(dates, totals, marker='o', color='#00d2ff', linewidth=3)
+    ax1.fill_between(dates, totals, color='#00d2ff', alpha=0.15)
+    ax1.set_title(f"💰 サーバー全体の資金量推移 (総額: {total_asset:,} S)", fontweight='bold', fontsize=16, pad=15)
     ax1.grid(True, alpha=0.2, linestyle='--')
-    if len(dates) > 6: ax1.set_xticks(dates[::max(1, len(dates)//4)])
+    if len(dates) > 10: ax1.set_xticks(dates[::max(1, len(dates)//7)])
 
-    ax4 = fig.add_subplot(gs[1, 0]) # 取引内訳(円グラフ)
-    if type_breakdown:
-        sorted_types = sorted(type_breakdown.items(), key=lambda x: x[1], reverse=True)
-        # 上位4つ + その他
-        top_n = 4
-        labels = [k for k, v in sorted_types[:top_n]]
-        sizes = [v for k, v in sorted_types[:top_n]]
-        if len(sorted_types) > top_n:
-            labels.append("Others")
-            sizes.append(sum(v for k, v in sorted_types[top_n:]))
-        
-        wedges, texts, autotexts = ax4.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90, 
-                                           counterclock=False, colors=plt.cm.Set3.colors, pctdistance=0.85)
-        # ドーナツ化
-        centre_circle = plt.Circle((0,0),0.70,fc='#2f3136')
-        ax4.add_artist(centre_circle)
-        ax4.text(0, 0, "GDP Breakdown", ha='center', va='center', color='white', fontweight='bold')
-        for t in texts: t.set_color('white')
-        for t in autotexts: t.set_color('black')
-    else:
-        ax4.text(0.5, 0.5, "No Data", ha='center', color='gray')
-    ax4.axis('equal')
-
-    # --- 2. 中央エリア: 格差と分布 ---
-    # ヒストグラム (階級分布)
-    ax2 = fig.add_subplot(gs[0, 1])
-    bins = [0, 1000, 10000, 50000, 100000, 500000, 1000000, float('inf')]
-    labels_hist = ['~1k', '10k', '50k', '100k', '500k', '1M', '1M+']
-    counts = [0] * len(labels_hist)
-    for b in balances:
-        for i, limit in enumerate(bins[1:]):
-            if b < limit:
-                counts[i] += 1
-                break
-    ax2.bar(labels_hist, counts, color='#f1c40f', alpha=0.8, edgecolor='white')
-    ax2.set_title("Wealth Class Distribution", fontweight='bold', color='white')
-    ax2.tick_params(axis='x', rotation=45)
-    ax2.grid(axis='y', alpha=0.2)
-
-    # ローレンツ曲線 (格差の可視化)
-    ax5 = fig.add_subplot(gs[1, 1])
-    ax5.plot([0, 1], [0, 1], color='gray', linestyle='--', label='Equality')
+    # --- 2. 中段: 資産分布（格差カーブ） ---
+    ax2 = fig.add_subplot(gs[1])
+    sorted_bal = sorted(balances)
+    count = len(sorted_bal)
+    x_users = list(range(1, count + 1))
     
-    count = len(balances)
+    ax2.plot(x_users, sorted_bal, color='#f1c40f', linewidth=3)
+    ax2.fill_between(x_users, sorted_bal, color='#f1c40f', alpha=0.2)
+    ax2.set_title("⚖️ 市民の資産分布（格差カーブ）", fontweight='bold', fontsize=16, pad=15)
+    ax2.set_xlabel("市民（左から右へ、資産が少ない順 → 多い順）", fontsize=12)
+    ax2.set_ylabel("所持金 (S)", fontsize=12)
+    ax2.grid(True, alpha=0.2, linestyle='--')
+
+    # ジニ係数の計算と日本語での状況判定
     if total_asset > 0 and count > 0:
-        sorted_bal = sorted(balances)
-        lorenz_x = [i / count for i in range(count + 1)]
-        # numpyなしで累積和
-        cum = 0
-        cum_assets = [0]
-        for b in sorted_bal:
-            cum += b
-            cum_assets.append(cum)
-        lorenz_y = [c / total_asset for c in cum_assets]
-        
-        # ジニ係数計算
         gini = (2 * sum((i + 1) * v for i, v in enumerate(sorted_bal)) / (count * total_asset)) - (count + 1) / count
         
-        ax5.plot(lorenz_x, lorenz_y, color='#ff00ff', linewidth=3, label=f'Gini: {gini:.3f}')
-        ax5.fill_between(lorenz_x, lorenz_x, lorenz_y, color='#ff00ff', alpha=0.15)
-        ax5.legend(loc='upper left')
-    ax5.set_title("Inequality Curve", fontweight='bold', color='white')
-    ax5.grid(True, alpha=0.3)
+        # 0に近いほど平等、1に近いほど格差が大きい
+        if gini < 0.3: status = "非常に平等な社会です 🕊️"
+        elif gini < 0.4: status = "適度な競争がある正常な経済です 🏃"
+        elif gini < 0.5: status = "少し格差が広がっています ⚠️"
+        else: status = "深刻な格差社会です（一部への富の集中） 🚨"
+    else:
+        gini = 0
+        status = "データなし"
 
-    # --- 3. 右エリア: 統計サマリー (テキスト埋め込み) ---
-    ax3 = fig.add_subplot(gs[:, 2]) # 縦長に使用
-    ax3.axis('off') # 軸を消す
+    # グラフ内に判定結果を目立つように表示
+    bbox_props = dict(boxstyle="round,pad=0.5", fc="#2b2d31", ec="#f1c40f", lw=2)
+    ax2.text(0.05, 0.85, f"ジニ係数: {gini:.3f}\n【評価】 {status}", 
+             transform=ax2.transAxes, fontsize=14, color='white', bbox=bbox_props)
+
+    # --- 3. 下段: 日本語の経済サマリーテキスト ---
+    ax3 = fig.add_subplot(gs[2])
+    ax3.axis('off') # 枠線を消す
     
-    # 統計データのテキスト化
     net_flow = flow_stats['mint'] - flow_stats['burn']
-    flow_color = "#2ecc71" if net_flow >= 0 else "#e74c3c"
     flow_sign = "+" if net_flow >= 0 else ""
-    
-    # トップ富豪（匿名化せず表示、またはID表示）
-    # ここではデータがないのでプレースホルダーですが、balancesと一緒に名前も渡せばランキング作れます
-    
-    text_content = [
-        f"== ECONOMY REPORT ==",
-        f"Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        f"",
-        f"[ CITIZENS ]",
-        f"Active Users : {active_citizens} citizens",
-        f"Avg Wealth   : {int(avg_asset):,} S",
-        f"Median Wealth: {int(sorted(balances)[len(balances)//2]) if balances else 0:,} S",
-        f"",
-        f"[ FLOW (24h) ]",
-        f"Mint (In)    : {flow_stats['mint']:,} S",
-        f"Burn (Out)   : {flow_stats['burn']:,} S",
-        f"-----------------------",
-        f"Net Flow     : {flow_sign}{net_flow:,} S",
-        f"",
-        f"[ VELOCITY ]",
-        f"GDP (Volume) : {flow_stats['gdp']:,} S",
-        f"Turnover Rate: {(flow_stats['gdp']/total_asset*100) if total_asset else 0:.2f} %",
-        f"",
-        f"[ ANALYSIS ]",
-        f"Target Period: Last {active_days} Days",
-    ]
-    
-    # テキストを描画
-    y_pos = 0.95
-    for line in text_content:
-        color = 'white'
-        weight = 'normal'
-        size = 14
-        
-        if "== " in line: 
-            size = 18; weight='bold'; color='#00d2ff'
-        if "Net Flow" in line:
-            color = flow_color; weight='bold'
-        if "[" in line and "]" in line:
-            color = '#f1c40f'; weight='bold'
-            
-        ax3.text(0.05, y_pos, line, transform=ax3.transAxes, fontsize=size, color=color, fontweight=weight, family='monospace')
-        y_pos -= 0.05
+    median_asset = int(sorted_bal[count//2]) if sorted_bal else 0
+    turnover = (flow_stats['gdp'] / total_asset * 100) if total_asset else 0
+
+    # スッキリと箇条書きでまとめる
+    summary_text = (
+        f"📋 【経済レポート】\n\n"
+        f"👥 アクティブ市民数 : {active_citizens} 人\n"
+        f"🏦 サーバー総資産   : {total_asset:,} S\n"
+        f"📊 平均資産         : {int(avg_asset):,} S\n"
+        f"🎯 中央値(一般的な層): {median_asset:,} S\n\n"
+        f"💸 【24時間のお金の動き】\n"
+        f"📥 発行額(Mint)     : {flow_stats['mint']:,} S\n"
+        f"📤 回収額(Burn)     : {flow_stats['burn']:,} S\n"
+        f"📈 差し引き増加量   : {flow_sign}{net_flow:,} S\n"
+        f"🔄 流通量(GDP)      : {flow_stats['gdp']:,} S  (資金回転率: {turnover:.2f}%)\n"
+    )
+
+    ax3.text(0.1, 0.9, summary_text, transform=ax3.transAxes, fontsize=15, color='white', verticalalignment='top')
 
     plt.tight_layout()
-    
-    # バッファに保存
     buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=100) # dpi調整で画質確保
+    plt.savefig(buf, format='png', dpi=100)
     buf.seek(0)
-    plt.close()
+    plt.close(fig)
     return buf
+
 
 class ServerStats(commands.Cog):
     def __init__(self, bot):
@@ -3239,6 +3203,7 @@ class ServerStats(commands.Cog):
         except Exception as e:
             traceback.print_exc()
             await interaction.followup.send(f"❌ レポート生成中にエラーが発生しました: {e}")
+
 
 class ShopPurchaseView(discord.ui.View):
     def __init__(self, bot, role_id, price, shop_id):
