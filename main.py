@@ -713,22 +713,24 @@ class Economy(commands.Cog):
 
     @app_commands.command(name="今日の残り回数", description="今日のギャンブル残り回数を確認します")
     async def check_remaining(self, interaction: discord.Interaction):
-    _, remaining_chinchiro = await check_daily_limit(self.bot, interaction.user.id, "chinchiro")
-    _, remaining_slot = await check_daily_limit(self.bot, interaction.user.id, "slot")
+        # ↓ ここから下の行は、すべて半角スペース4つ分（またはTab1回分）右にズラす
+        _, remaining_chinchiro = await check_daily_limit(self.bot, interaction.user.id, "chinchiro")
+        _, remaining_slot = await check_daily_limit(self.bot, interaction.user.id, "slot")
 
-    embed = discord.Embed(title="🎲 本日のギャンブル残り回数", color=0x2b2d31)
-    embed.add_field(
-        name="🎲 チンチロ",
-        value=f"残り **{min(remaining_chinchiro, 10)} / 10** 回" if remaining_chinchiro < 99999 else "✨ 制限解除中",
-        inline=True
-    )
-    embed.add_field(
-        name="🎰 スロット",
-        value=f"残り **{min(remaining_slot, 10)} / 10** 回" if remaining_slot < 99999 else "✨ 制限解除中",
-        inline=True
-    )
-    embed.set_footer(text="制限は毎日0時にリセットされます")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+        embed = discord.Embed(title="🎲 本日のギャンブル残り回数", color=0x2b2d31)
+        embed.add_field(
+            name="🎲 チンチロ",
+            value=f"残り **{min(remaining_chinchiro, 10)} / 10** 回" if remaining_chinchiro < 99999 else "✨ 制限解除中",
+            inline=True
+        )
+        embed.add_field(
+            name="🎰 スロット",
+            value=f"残り **{min(remaining_slot, 10)} / 10** 回" if remaining_slot < 99999 else "✨ 制限解除中",
+            inline=True
+        )
+        embed.set_footer(text="制限は毎日0時にリセットされます")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
 
     # === 追加機能1: 所持金ランキング ===
     @app_commands.command(name="ランキング", description="サーバー内の大富豪トップ10を表示します")
