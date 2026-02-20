@@ -1607,91 +1607,109 @@ class ChinchiroPVPApplyView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=None)
         self.stop()
 
-
 # --- 本体 (Cog) ---
+import random
+import datetime
+import asyncio
+import discord
+from discord.ext import commands
+from discord import app_commands
+
 class Chinchiro(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.last_played = {}
         self.play_counts = {} # セッション中のプレイ回数（湿度管理用）
         self.max_bet = 200000 # 賭け金上限
-        self.tax_rate_pve = 0.08  # PvE 税率 8% (RTP調整)
+        self.tax_rate_pve = 0.05  # PvE 税率 5% (総合RTP 約85%)
         self.tax_rate_pvp = 0.05  # PvP 場所代 5%
 
-    # --- セリフ管理 (あなたのコードを完全維持 + PvP用追加) ---
-    def get_cesta_dialogue(self, situation, user_name, amount=0, humidity=0):
-        # humidity (湿度): プレイ回数が多いほど高くなる 0~10+
+    # --- セリフ管理 (完全版：メスガキ＋イースターエッグ＋ガチデレ) ---
+    def get_cesta_dialogue(self, situation, user_name, amount=0, humidity=0, is_all_in=False):
         
-        # --- 激レアデレ (1%) ---
-        if random.randint(1, 100) == 1:
-            return pink(f"…{user_name}、たまには勝ってよ。…あんたが負けてるとこ、あんま見たくないし。")
+        # 🥚 イースターエッグ 1: 煩悩ベット (108 Stell)
+        if situation == "intro" and amount == 108:
+            return "108Stell？ 煩悩の数？ …ホント、あんたって救いようのないバカだね♡ さっさとむしり取ってあげる！"
 
-        # --- 湿度高め（常連・高回数プレイ時） ---
-        if humidity >= 5 and random.random() < 0.4:
+        # 🥚 イースターエッグ 2: 鯖主「釈迦」専用セリフ (50%で発生)
+        if "釈迦" in user_name and random.random() < 0.5:
+            shaka_lines = {
+                "intro": "……あっ、鯖主。べ、別にサボってないわよ！ あんたの代わりにカモから巻き上げてやってるんだから感謝しなさいよね！",
+                "win_big": "……チッ、鯖主権限で確率いじったでしょ！ ズルいズルい！ 運営の横暴だー！",
+                "lose_big": "……っ！ しゃ、釈迦のくせに煩悩まみれで大負けしてんじゃん！ ダッサ！ 鯖主引退すれば？♡",
+                "shomben_player": "はーい鯖主のションベンいただきましたー！ スクショして全体公開しよっかなー♡ ざぁこ♡"
+            }
+            if situation in shaka_lines:
+                return shaka_lines[situation]
+
+        # 🥚 イースターエッグ 3: 全額ベット（オールイン）時のガチデレ
+        if is_all_in:
+            if situation == "intro":
+                return f"は！？ 全財産（{amount:,} Stell）賭けるって正気！？\n……バカ。もし一文無しになって、ここに来なくなったら……私、つまんないんだけど。\n……絶対勝ちなさいよ。応援してあげるから。"
+            elif situation in ["win_small", "win_big"]:
+                return "……っ！ よ、よかったぁ……。心臓止まるかと思った……。もうこんな無茶、絶対しちゃダメだからね！"
+            elif situation in ["lose_normal", "lose_big"]:
+                return "……バカ。ほんと、どうしようもないバカ……。ほら、ちょっとこっち来なさい。……今日だけは、慰めてあげるから。"
+
+        # 湿度高め（常連・高回数プレイ時）のデレ
+        if humidity >= 5 and random.random() < 0.3:
             heavy_lines = [
-                f"ねぇ{user_name}、他のこと考えてない？ …私だけ見てればいいじゃん。",
-                "まだやるよね？ …帰さないし。",
-                "…あんたのそういう、後先考えないところ…嫌いじゃないけど。",
-                f"私に全部貢ぐつもりでやってよ。…{user_name}のお金は私のもの、でしょ？",
-                "…ねえ、もし破産したらさ。私が飼ってあげよっか？ …冗談に聞こえる？"
+                f"…何度も何度も、そんなに私に構ってほしいの？ しょーがないなぁ…♡",
+                f"ざぁこ♡ …って言いたいとこだけど、{user_name}の粘り強さだけは認めてあげなくもないわ。",
+                "ねぇ、そろそろ休憩しない？ …べ、別に心配してるわけじゃないから！私が疲れただけ！",
+                "あんたのお金、全部私が管理してあげよっか？ …なーんてね。冗談に決まってんじゃん。"
             ]
             return random.choice(heavy_lines)
 
         dialogues = {
-            # ゲーム開始
             "intro_normal": [
-                f"…また来たの。{user_name}も暇人だね。",
-                "ふーん、やるんだ。…準備いい？",
-                "…私の相手してくれるの？ まぁ、付き合ってあげなくもないけど。"
+                f"お金溶かしに来たの？ いいよ、相手してあげる。ざぁこ♡",
+                f"ふーん、{user_name}か。すぐ泣きべそかくくせに、懲りないねぇ。",
+                "はいはい、チンチロね。むしり取ってあげるから覚悟しなさいよね！"
             ],
-            "intro_high": [ # 高額
-                f"…へぇ、{amount:,} Stell。大きく出たね。",
-                "…無理してない？ まぁ、あんたがどうなろうと私の知ったことじゃないけど。"
+            "intro_high": [
+                f"…へぇ、{amount:,} Stell。あんたにしては度胸あるじゃん。",
+                "ちょっと、本気？ …負けても泣かないって約束できるなら、受けてあげる。"
             ],
-            
-            # PvP: 開始 (追加)
             "pvp_start": [
-                "…へぇ、潰し合うんだ。いいね、人間の醜い争い、大好きよ。",
-                "さぁ、殺し合いなさい。場所は貸してあげるから。",
-                "…どっちが養分になるのかな？ 楽しみ。"
+                "おっ、バカ同士の潰し合い？ 特等席で見させてもらうわ♡",
+                "さぁ、どっちが私の養分になるのかなー？ 楽しみ！"
             ],
-            # PvP: 決着 (追加)
             "pvp_end": [
-                "…あーあ。友情、壊れちゃったね（笑）",
-                "…勝者には賞賛を。敗者には…ま、ドンマイ。",
-                "…他人の不幸で食べるご飯は美味しい？ ふふ。"
+                "あーあ、負けた方はダッサいねー♡ 勝った方、場所代きっちり頂くわよ。",
+                "はい決着！ …他人の不幸で食べるご飯って最高に美味しいよね。"
             ],
-            
-            # プレイヤー勝利 (ツンデレ・不満)
             "win_small": [ 
-                "…運だけはいいみたいね。調子乗らないでよ？",
-                "はいはい、勝ち分。…別に、あんたが勝っても私は痛くないし。",
-                "…チッ。まぁいいわ、貸しにしとく。"
+                "チッ…運だけはいいみたいね。調子乗んな！",
+                "はいはい、勝ち分。…たかが一勝でドヤ顔しないでよね。",
+                "…あっそ。次で全部取り返してあげるんだから。"
             ],
             "win_big": [ 
-                "…はぁ？ 勝ちすぎじゃない？ …なんかムカつく。",
-                "嘘でしょ…イカサマしてない？ …してないならいいけど。",
-                "…すごいじゃん。ちょっとだけ見直したかも。…ちょっとだけね。"
+                "はぁ！？ ちょ、なんかイカサマしたでしょ！ …証拠がないから払うけど！",
+                "…っ！ べ、別に悔しくなんてないし！ たまたまよ、たまたま！",
+                "…やるじゃん。ちょっとだけ見直してあげなくもない…わよ。"
             ],
-            
-            # プレイヤー敗北 (メスガキ感〜心配)
             "lose_normal": [ 
-                "はい、没収ー。叙々苑でもいく？笑。",
-                "ざぁこ♡ …あ、ごめん。本音が。",
-                "…弱すぎ。もっと本気出しなよ。",
-                "あーあ、溶けちゃった。どんまーい。"
+                "はい、全額没収ー！ ざぁこ♡ よわよわ♡",
+                "あーあ、また溶かしちゃったね。私のお小遣いあざーっす♡",
+                "弱すぎなんですけどー！ 出直してきな！"
             ],
             "lose_big": [ 
-                "…うわ、派手に負けたね。…大丈夫？ ご飯食べるお金ある？",
-                "…バカじゃないの？ ほんと、私がいないとダメなんだから。",
-                "…あーあ。もう取り返せないかもね？ どうする？"
+                "…っ！ ちょ、そんなに派手に負けて大丈夫なの！？",
+                "…バカじゃないの！？ 加減ってものを知りなさいよ！",
+                "あーあ…破産しても私は知らないからね。…ホントに大丈夫なの？"
             ],
-            
-            # 引き分け（親勝ち）
-            "draw_lose": [ 
-                "…あ、同じ目だ。でもここ私の場所だから。…悪いね、総取りさせてもらうよ。",
-                "…引き分け？ 甘いなぁ。親の特権、使わせてもらうね。",
-                "…文句ある？ ないよね。私のルールだもん。"
+            "draw_push": [
+                "…同点？ チッ、今回は私の奢り（ノーカン）にしてあげるわ。感謝しなさいよね！",
+                "引き分けかぁ。…今回は見逃してあげる。次こそむしり取るから！"
+            ],
+            "shomben_parent": [
+                "……あっ。……い、今のノーカン！ ノーカンだから！！ 見てないでしょ！？",
+                "ちょっ、サイコロ滑っただけだし！ ズルいズルい！！"
+            ],
+            "shomben_player": [
+                "ダッサ！！ ションベンとかありえないんですけどー！ ざぁこ♡",
+                "はーい盤外落下！ あんたホントに不器用だねー♡ はい没収！"
             ]
         }
 
@@ -1701,8 +1719,12 @@ class Chinchiro(commands.Cog):
         
         return random.choice(dialogues.get(situation, dialogues["lose_normal"]))
 
-    # --- ダイス・描画ロジック (変更なし) ---
+    # --- ダイス・描画ロジック ---
     def get_roll_result(self):
+        # 3%の確率で「ションベン（盤外）」発生
+        if random.random() < 0.03:
+            return [0, 0, 0], -99, "ションベン", -1, "💦 盤外", False
+
         dice = [random.randint(1, 6) for _ in range(3)]
         dice.sort()
         
@@ -1718,6 +1740,9 @@ class Chinchiro(commands.Cog):
         return dice, 0, "役なし", 0, "💀 没収", False
 
     def get_cyber_dice_string(self, dice_list):
+        if dice_list == [0, 0, 0]:
+            return "×  ×  ×"
+        # CYBER_DICE は外部で定義されている前提
         return "  ".join([CYBER_DICE.get(num, CYBER_DICE["?"]) for num in dice_list])
 
     def render_hud(self, player_name, dice_list, status, color_mode="blue"):
@@ -1731,6 +1756,7 @@ class Chinchiro(commands.Cog):
         if "リーチ" in status: c_stat_text = red
         elif "神" in status: c_stat_text = yellow
         elif "勝ち" in status: c_stat_text = yellow
+        elif "盤外" in status: c_stat_text = red
 
         dice_row = self.get_cyber_dice_string(dice_list)
         dice_centered = dice_row.center(26 - 3)
@@ -1750,6 +1776,14 @@ class Chinchiro(commands.Cog):
 
     async def play_animation(self, msg, embed, field_idx, player_name, final_dice, rank_text, score, is_super):
         try:
+            # ションベン時は即時結果表示
+            if score == -99:
+                final_hud = self.render_hud(player_name, final_dice, rank_text, "red")
+                embed.set_field_at(field_idx, name=f"💦 {player_name}", value=final_hud, inline=False)
+                await msg.edit(embed=embed)
+                await asyncio.sleep(1.0)
+                return
+
             rand_dice = [random.randint(1,6) for _ in range(3)]
             hud = self.render_hud(player_name, rand_dice, "回転中...", "blue")
             embed.set_field_at(field_idx, name=f"🎲 {player_name}", value=hud, inline=False)
@@ -1767,7 +1801,7 @@ class Chinchiro(commands.Cog):
             if is_super: res_color = "gold"
             elif score >= 90: res_color = "gold"
             elif score == -1: res_color = "purple"
-            elif score == 0: res_color = "red"
+            elif score <= 0: res_color = "red"
             
             final_hud = self.render_hud(player_name, final_dice, rank_text, res_color)
             embed.set_field_at(field_idx, name=f"🏁 {player_name}", value=final_hud, inline=False)
@@ -1788,6 +1822,9 @@ class Chinchiro(commands.Cog):
             dice, score, name, mult, rank, is_super = self.get_roll_result()
             await self.play_animation(msg, embed, field_idx, player.display_name, dice, name, score, is_super)
             
+            if score == -99: # ションベン
+                return {"score": score, "mult": mult, "dice": dice, "name": name, "is_super": False}
+
             if score >= 90 or score == -1 or try_num == 3:
                 best_res = {"score": score, "mult": mult, "dice": dice, "name": name, "is_super": is_super}
                 break
@@ -1807,86 +1844,160 @@ class Chinchiro(commands.Cog):
         
         return best_res
 
-    # ------------------------------------------------------------------
-    #  PvE: 対セスタ (既存コード維持)
-    # ------------------------------------------------------------------
+  
     @app_commands.command(name="チンチロ", description="セスタと勝負。")
     async def chinchiro(self, interaction: discord.Interaction, bet: int):
-        # 1. バリデーション
         if bet < 100: 
             return await interaction.response.send_message("100Stellからにして。小銭じゃつまんないし。", ephemeral=True)
         if bet > self.max_bet:
-            return await interaction.response.send_message(f"賭けすぎでしょ、負けたときの事とか考えないわけー？上限は **{self.max_bet:,} Stell** まで。…破産されても困るし。", ephemeral=True)
+            return await interaction.response.send_message(f"上限は **{self.max_bet:,} Stell** まで！ 私が破産しちゃうでしょ！", ephemeral=True)
 
-        # 2. 連続プレイ & 湿度管理
         now = datetime.datetime.now()
         last_time = self.last_played.get(interaction.user.id)
         
-        # 30分以上空いたら湿度リセット
         if last_time and (now - last_time).total_seconds() > 1800:
             self.play_counts[interaction.user.id] = 0
         
         if last_time and (now - last_time).total_seconds() < 3.0: 
-            return await interaction.response.send_message("ちょっと焦りすぎじゃない？落ち着きなよ。", ephemeral=True)
+            return await interaction.response.send_message("ちょっと焦りすぎじゃない？ ざぁこ♡", ephemeral=True)
 
         self.last_played[interaction.user.id] = now
         self.play_counts[interaction.user.id] = self.play_counts.get(interaction.user.id, 0) + 1
         humidity = self.play_counts[interaction.user.id]
 
-        # 3. 残高確認
-        if not await self.check_balance(interaction.user, bet):
-            return await interaction.response.send_message("…お金ないじゃん。私のことからかってる？", ephemeral=True)
+        # 残高とオールイン判定の取得
+        async with self.bot.get_db() as db:
+            async with db.execute("SELECT balance FROM accounts WHERE user_id = ?", (interaction.user.id,)) as c:
+                row = await c.fetchone()
+                if not row or row['balance'] < bet:
+                    return await interaction.response.send_message("…お金ないじゃん。出直してきな！", ephemeral=True)
+                curr_balance = row['balance']
+
+        is_all_in = (bet == curr_balance and bet >= 100)
 
         await interaction.response.defer()
 
-        # オープニング
-        opening_line = self.get_cesta_dialogue("intro", interaction.user.display_name, bet, humidity)
-        
+        opening_line = self.get_cesta_dialogue("intro", interaction.user.display_name, bet, humidity, is_all_in)
         embed = discord.Embed(title="🎲 セスタの賭博", description=opening_line, color=0x2f3136)
         embed.set_thumbnail(url=self.bot.user.display_avatar.url)
         embed.add_field(name="親：セスタ", value=self.render_hud("セスタ", ["?", "?", "?"], "待機中..."), inline=False)
         embed.add_field(name=f"子：{interaction.user.display_name}", value="準備中...", inline=False)
         msg = await interaction.followup.send(embed=embed)
 
-        # 親（セスタ）のターン
         p_dice, p_score, p_name, p_mult, p_rank, p_super = self.get_roll_result()
-        if p_score == 0: # 親は目なしなら1回振り直し
+        if p_score == 0: 
              p_dice, p_score, p_name, p_mult, p_rank, p_super = self.get_roll_result()
 
-        phud = self.render_hud("セスタ", p_dice, p_name, "gold" if p_super else "red")
+        phud = self.render_hud("セスタ", p_dice, p_name, "gold" if p_super else ("red" if p_score <= 0 else "blue"))
         embed.set_field_at(0, name="親：セスタ (確定)", value=phud, inline=False)
         await msg.edit(embed=embed)
         
-        # 親が即勝利（シゴロ以上）
         if p_score >= 90:
-             return await self.settle_pve(msg, embed, interaction.user, bet, -p_mult if p_mult > 0 else -1, humidity, True)
+             return await self.settle_pve(msg, embed, interaction.user, bet, -p_mult if p_mult > 0 else -1, humidity, p_score, 0, is_all_in)
+        if p_score == -99:
+             return await self.settle_pve(msg, embed, interaction.user, bet, 1, humidity, p_score, 0, is_all_in)
 
-        # 子のターン
         u_res = await self.run_player_turn(msg, embed, 1, interaction.user)
         u_score, u_mult = u_res["score"], u_res["mult"]
 
-        # 勝敗判定 (引き分けは親の勝ち = 没収)
         final_mult = 0
-        is_draw_loss = False
-
-        if u_score == -1: # ヒフミ（倍払い）
-            final_mult = -2 
-        elif u_score > p_score: # 勝ち
-            final_mult = max(u_mult, abs(p_mult) if p_mult < 0 else 1)
-        elif u_score < p_score: # 負け
-            final_mult = -max(p_mult, abs(u_mult) if u_mult < 0 else 1)
-        else: # 引き分け（没収）
+        if u_score == -99:
             final_mult = -1
-            is_draw_loss = True
+        elif u_score == -1:
+            final_mult = -2 
+        elif u_score > p_score:
+            final_mult = max(u_mult, abs(p_mult) if p_mult < 0 else 1)
+        elif u_score < p_score:
+            final_mult = -max(p_mult, abs(u_mult) if u_mult < 0 else 1)
+        else:
+            final_mult = 0 # 引き分けは0(返金)
 
-        await self.settle_pve(msg, embed, interaction.user, bet, final_mult, humidity, False, is_draw_loss)
+        await self.settle_pve(msg, embed, interaction.user, bet, final_mult, humidity, p_score, u_score, is_all_in)
 
-    async def settle_pve(self, msg, embed, user, bet, multiplier, humidity, is_instant_loss=False, is_draw_loss=False):
+    async def settle_pve(self, msg, embed, user, bet, multiplier, humidity, p_score=0, u_score=0, is_all_in=False):
         async with self.bot.get_db() as db:
+            async with db.execute("SELECT balance FROM accounts WHERE user_id = ?", (user.id,)) as c:
+                curr_balance = (await c.fetchone())['balance']
+    # ------------------------------------------------------------------
+    #  PvE: 対セスタ
+    # ------------------------------------------------------------------
+    @app_commands.command(name="チンチロ", description="セスタと勝負。")
+    async def chinchiro(self, interaction: discord.Interaction, bet: int):
+        if bet < 100: 
+            return await interaction.response.send_message(f"は？ {bet} Stell？ 小銭じゃつまんないんですけどー。100Stellからにしてよね、ざぁこ♡", ephemeral=True)
+        if bet > self.max_bet:
+            return await interaction.response.send_message(f"ちょっと！ 上限は **{self.max_bet:,} Stell** まで！ 私から全部巻き上げるつもり！？ …手加減しなさいよ！", ephemeral=True)
+
+        now = datetime.datetime.now()
+        last_time = self.last_played.get(interaction.user.id)
+        
+        if last_time and (now - last_time).total_seconds() > 1800:
+            self.play_counts[interaction.user.id] = 0
+        
+        if last_time and (now - last_time).total_seconds() < 3.0: 
+            return await interaction.response.send_message("ちょっと焦りすぎじゃない？ がっつきすぎでキモいんですけどー♡ 落ち着きなよ。", ephemeral=True)
+
+        self.last_played[interaction.user.id] = now
+        self.play_counts[interaction.user.id] = self.play_counts.get(interaction.user.id, 0) + 1
+        humidity = self.play_counts[interaction.user.id]
+
+        # 残高とオールイン判定の取得
+        async with self.bot.get_db() as db:
+            async with db.execute("SELECT balance FROM accounts WHERE user_id = ?", (interaction.user.id,)) as c:
+                row = await c.fetchone()
+                if not row or row['balance'] < bet:
+                    return await interaction.response.send_message("…は？ お金ないじゃん。私に貢ぐお金すら無くなっちゃったの？ ざぁこ♡ 出直してきな！", ephemeral=True)
+                curr_balance = row['balance']
+
+        is_all_in = (bet == curr_balance and bet >= 100)
+
+        await interaction.response.defer()
+
+        opening_line = self.get_cesta_dialogue("intro", interaction.user.display_name, bet, humidity, is_all_in)
+        embed = discord.Embed(title="🎲 セスタの賭博", description=opening_line, color=0x2f3136)
+        embed.set_thumbnail(url=self.bot.user.display_avatar.url)
+        embed.add_field(name="親：セスタ", value=self.render_hud("セスタ", ["?", "?", "?"], "待機中..."), inline=False)
+        embed.add_field(name=f"子：{interaction.user.display_name}", value="準備中...", inline=False)
+        msg = await interaction.followup.send(embed=embed)
+
+        p_dice, p_score, p_name, p_mult, p_rank, p_super = self.get_roll_result()
+        if p_score == 0: 
+             p_dice, p_score, p_name, p_mult, p_rank, p_super = self.get_roll_result()
+
+        phud = self.render_hud("セスタ", p_dice, p_name, "gold" if p_super else ("red" if p_score <= 0 else "blue"))
+        embed.set_field_at(0, name="親：セスタ (確定)", value=phud, inline=False)
+        await msg.edit(embed=embed)
+        
+        if p_score >= 90:
+             return await self.settle_pve(msg, embed, interaction.user, bet, -p_mult if p_mult > 0 else -1, humidity, p_score, 0, is_all_in)
+        if p_score == -99:
+             return await self.settle_pve(msg, embed, interaction.user, bet, 1, humidity, p_score, 0, is_all_in)
+
+        u_res = await self.run_player_turn(msg, embed, 1, interaction.user)
+        u_score, u_mult = u_res["score"], u_res["mult"]
+
+        final_mult = 0
+        if u_score == -99:
+            final_mult = -1
+        elif u_score == -1:
+            final_mult = -2 
+        elif u_score > p_score:
+            final_mult = max(u_mult, abs(p_mult) if p_mult < 0 else 1)
+        elif u_score < p_score:
+            final_mult = -max(p_mult, abs(u_mult) if u_mult < 0 else 1)
+        else:
+            final_mult = 0 # 引き分けは0(返金)
+
+        await self.settle_pve(msg, embed, interaction.user, bet, final_mult, humidity, p_score, u_score, is_all_in)
+
+    async def settle_pve(self, msg, embed, user, bet, multiplier, humidity, p_score=0, u_score=0, is_all_in=False):
+        async with self.bot.get_db() as db:
+            async with db.execute("SELECT balance FROM accounts WHERE user_id = ?", (user.id,)) as c:
+                curr_balance = (await c.fetchone())['balance']
+
             if multiplier > 0:
-                # --- 勝利 ---
                 raw_win = bet * multiplier
-                tax = int(raw_win * self.tax_rate_pve) # 税金8%
+                tax = int(raw_win * self.tax_rate_pve)
                 final_profit = raw_win - tax
                 
                 await db.execute("UPDATE accounts SET balance = balance + ? WHERE user_id = ?", (final_profit, user.id))
@@ -1896,22 +2007,20 @@ class Chinchiro(commands.Cog):
                 if multiplier > 1: res_str += f" (x{multiplier})"
                 res_str += f"\n(手数料: {tax:,} S)"
                 
-                comment_key = "win_big" if multiplier >= 3 else "win_small"
-                comment = self.get_cesta_dialogue(comment_key, user.display_name, 0, humidity)
+                if p_score == -99:
+                    comment = self.get_cesta_dialogue("shomben_parent", user.display_name, 0, humidity, is_all_in)
+                else:
+                    comment_key = "win_big" if multiplier >= 3 else "win_small"
+                    comment = self.get_cesta_dialogue(comment_key, user.display_name, 0, humidity, is_all_in)
                 embed.description = comment
 
-            else:
-                # --- 敗北 ---
+            elif multiplier < 0:
                 loss_mult = abs(multiplier)
                 loss_amount = bet * loss_mult
+                actual_loss = min(loss_amount, curr_balance)
                 
-                async with db.execute("SELECT balance FROM accounts WHERE user_id = ?", (user.id,)) as c:
-                    curr = (await c.fetchone())['balance']
-                
-                actual_loss = min(loss_amount, curr)
                 await db.execute("UPDATE accounts SET balance = balance - ? WHERE user_id = ?", (actual_loss, user.id))
                 
-                # ジャックポット還元 (5%)
                 jp_feed = int(actual_loss * 0.05)
                 if jp_feed > 0:
                     await db.execute("""
@@ -1923,14 +2032,18 @@ class Chinchiro(commands.Cog):
                 res_str = f"💀 **LOSE... -{actual_loss:,} Stell**"
                 if loss_mult > 1: res_str += f" (x{loss_mult} 倍払い)"
                 
-                if is_draw_loss:
-                    res_str += "\n(親の総取り)"
-                    comment = self.get_cesta_dialogue("draw_lose", user.display_name, 0, humidity)
+                if u_score == -99:
+                    comment = self.get_cesta_dialogue("shomben_player", user.display_name, 0, humidity, is_all_in)
                 else:
                     comment_key = "lose_big" if loss_mult >= 2 else "lose_normal"
-                    comment = self.get_cesta_dialogue(comment_key, user.display_name, actual_loss, humidity)
-                
+                    comment = self.get_cesta_dialogue(comment_key, user.display_name, actual_loss, humidity, is_all_in)
+
                 embed.description = comment
+
+            else:
+                embed.color = 0x808080
+                res_str = f"🤝 **DRAW (引き分け)**\nベット額 {bet:,} Stell は返還されました。"
+                embed.description = self.get_cesta_dialogue("draw_push", user.display_name, 0, humidity, is_all_in)
             
             await db.commit()
             
@@ -1938,38 +2051,35 @@ class Chinchiro(commands.Cog):
         await msg.edit(embed=embed, view=None)
 
     # ------------------------------------------------------------------
-    #  PvP: 対人戦 (完全新規追加)
+    #  PvP: 対人戦
     # ------------------------------------------------------------------
     @app_commands.command(name="チンチロ対戦", description="【PVP】他のユーザーと1vs1で勝負します。")
     @app_commands.describe(opponent="対戦相手", bet="賭け金")
     async def pvp_chinchiro(self, interaction: discord.Interaction, opponent: discord.Member, bet: int):
         if opponent.bot or opponent == interaction.user:
-            return await interaction.response.send_message("…ねえ、虚しくない？ ちゃんと相手を選びなよ。", ephemeral=True)
-        if bet < 500: return await interaction.response.send_message("対戦は500Stellから。", ephemeral=True)
-        if bet > self.max_bet: return await interaction.response.send_message(f"上限は {self.max_bet:,} Stell まで。", ephemeral=True)
+            return await interaction.response.send_message("…ねえ、バカなの？ 虚空に向かってチンチロするとかウケるんですけどー♡ ちゃんと相手を選びなよ。", ephemeral=True)
+        if bet < 500: return await interaction.response.send_message("対戦は500Stellから。小銭の奪い合いとか見苦しいだけだからやめてよね。", ephemeral=True)
+        if bet > self.max_bet: return await interaction.response.send_message(f"上限は {self.max_bet:,} Stell まで。どんだけ熱くなってんの？ 少しは落ち着きなよ。", ephemeral=True)
 
         if not await self.check_balance(interaction.user, bet):
-             return await interaction.response.send_message("…あんた、お金ないじゃん。", ephemeral=True)
+             return await interaction.response.send_message("…あんた、お金ないじゃん。自分のお財布も確認できないの？ ざぁこ♡", ephemeral=True)
         if not await self.check_balance(opponent, bet):
-             return await interaction.response.send_message("…相手がお金持ってないみたい。貧乏人同士で喧嘩しないでよ。", ephemeral=True)
+             return await interaction.response.send_message("…相手がお金持ってないみたい。貧乏人同士で喧嘩しないでよ、みすぼらしいなぁ。", ephemeral=True)
 
-        # 申し込みEmbed
         embed = discord.Embed(title="⚔️ 決闘の申し込み", description=f"{interaction.user.mention} が {opponent.mention} に勝負を挑んだわ。\n\n💰 **レート: {bet:,} Stell**", color=0xff0000)
         embed.set_thumbnail(url=opponent.display_avatar.url)
-        embed.set_footer(text="受けるも逃げるも自由よ。…ま、逃げるなんてダサいけど（笑）")
+        embed.set_footer(text="受けるも逃げるも自由よ。…ま、逃げたら一生バカにしてあげるけどね♡")
 
         view = ChinchiroPVPApplyView(self, interaction.user, opponent, bet)
         await interaction.response.send_message(content=opponent.mention, embed=embed, view=view)
         view.message = await interaction.original_response()
 
     async def start_pvp_game(self, interaction, challenger, opponent, bet):
-        # 賭け金を先に徴収（逃げ防止）
         async with self.bot.get_db() as db:
             await db.execute("UPDATE accounts SET balance = balance - ? WHERE user_id = ?", (bet, challenger.id))
             await db.execute("UPDATE accounts SET balance = balance - ? WHERE user_id = ?", (bet, opponent.id))
             await db.commit()
 
-        # 開始演出
         embed = discord.Embed(title="⚔️ PVP CHINCHIRO", description=self.get_cesta_dialogue("pvp_start", ""), color=0x990000)
         hud_1 = self.render_hud(challenger.display_name, ["?", "?", "?"], "待機中...")
         hud_2 = self.render_hud(opponent.display_name, ["?", "?", "?"], "待機中...")
@@ -1979,9 +2089,7 @@ class Chinchiro(commands.Cog):
         msg = interaction.message
         await msg.edit(content=None, embed=embed, view=None)
 
-        # 1P (チャレンジャー)
         c_res = await self.run_player_turn(msg, embed, 0, challenger)
-        # 2P (相手)
         o_res = await self.run_player_turn(msg, embed, 1, opponent)
 
         await self.settle_pvp(msg, embed, challenger, opponent, bet, c_res, o_res)
@@ -1995,7 +2103,13 @@ class Chinchiro(commands.Cog):
         payout_mult = 1
         is_draw = False
 
-        if s1 > s2:
+        if s1 == -99 and s2 == -99:
+            is_draw = True
+        elif s1 == -99:
+            winner, loser = p2, p1
+        elif s2 == -99:
+            winner, loser = p1, p2
+        elif s1 > s2:
             winner, loser = p1, p2
             payout_mult = max(m1 if m1 > 0 else 1, abs(m2) if m2 < 0 else 1)
         elif s2 > s1:
@@ -2006,7 +2120,6 @@ class Chinchiro(commands.Cog):
 
         async with self.bot.get_db() as db:
             if is_draw:
-                # 引き分けなら賭け金を返金
                 await db.execute("UPDATE accounts SET balance = balance + ? WHERE user_id = ?", (bet, p1.id))
                 await db.execute("UPDATE accounts SET balance = balance + ? WHERE user_id = ?", (bet, p2.id))
                 
@@ -2014,16 +2127,12 @@ class Chinchiro(commands.Cog):
                 embed.color = 0x808080
 
             else:
-                # 勝利処理
-                # Pot = (bet * 2) が場にある（徴収済み）。
                 base_pot = bet * 2
                 extra_take = 0
                 
                 if payout_mult > 1:
-                    # 追加で奪う額 (倍率分 - 既に払った1倍分)
                     extra_needed = bet * (payout_mult - 1)
                     
-                    # 敗者の残高確認
                     async with db.execute("SELECT balance FROM accounts WHERE user_id = ?", (loser.id,)) as c:
                         l_bal = (await c.fetchone())['balance']
                     
@@ -2032,14 +2141,11 @@ class Chinchiro(commands.Cog):
                         await db.execute("UPDATE accounts SET balance = balance - ? WHERE user_id = ?", (extra_take, loser.id))
                 
                 total_win = base_pot + extra_take
-                
-                # 場所代徴収 (5%)
                 fee = int(total_win * self.tax_rate_pvp)
                 final_payout = total_win - fee
                 
                 await db.execute("UPDATE accounts SET balance = balance + ? WHERE user_id = ?", (final_payout, winner.id))
                 
-                # 演出
                 cesta_msg = self.get_cesta_dialogue("pvp_end", "")
                 
                 res_hud = (
@@ -2059,12 +2165,13 @@ class Chinchiro(commands.Cog):
             
             await db.commit()
 
-            # 結果フィールド更新
             embed.clear_fields()
             embed.add_field(name=f"1P: {p1.display_name}", value=f"{r1['name']} ({r1['score']})", inline=True)
             embed.add_field(name=f"2P: {p2.display_name}", value=f"{r2['name']} ({r2['score']})", inline=True)
             
             await msg.edit(embed=embed, view=None)
+
+
 
             
     @app_commands.command(name="ゴミ拾い", description="所持金が500Stell以下の時だけ使えます。")
@@ -2075,7 +2182,7 @@ class Chinchiro(commands.Cog):
                 bal = row['balance'] if row else 0
             
             if bal > 500:
-                return await interaction.response.send_message("「まだ持ってるでしょ？ 欲張らないで。」", ephemeral=True)
+                return await interaction.response.send_message("まだ持ってるでしょ？ 欲張らないで。", ephemeral=True)
             
             amount = random.randint(500, 1500)
             await db.execute("UPDATE accounts SET balance = balance + ? WHERE user_id = ?", (amount, interaction.user.id))
@@ -2084,7 +2191,7 @@ class Chinchiro(commands.Cog):
             msg_text = self.get_stella_dialogue("scavenge", interaction.user.display_name)
             
             if random.randint(1, 20) == 1:
-                msg_text = f"「…はぁ。仕方ないわね。\nこれ、私が落としたことにしといてあげる。」\n(ステラがそっぽを向きながら **{amount} Stell** を投げ捨てた！)"
+                msg_text = f"「…はぁ。仕方ないわね。\nこれ、私が落としたことにしといてあげる。」\n(セスタがそっぽを向きながら **{amount} Stell** を投げ捨てた！)"
 
             await interaction.response.send_message(f"{msg_text}\n\n🗑️ 公園で空き缶を拾って **{amount} Stell** になりました。")
 
