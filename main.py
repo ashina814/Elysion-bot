@@ -165,7 +165,7 @@ class BankDatabase:
 
                 # 3. VC関連
         # ▼ 古い形式のテーブルを一度削除して作り直す（★起動確認後はここに # をつけて無効化！）
-       # await conn.execute("DROP TABLE IF EXISTS voice_stats")
+        await conn.execute("DROP TABLE IF EXISTS voice_stats")
         
         # ▼ 月間対応の新しいテーブルを作成
         await conn.execute("""CREATE TABLE IF NOT EXISTS voice_stats (
