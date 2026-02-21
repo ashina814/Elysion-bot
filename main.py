@@ -273,13 +273,12 @@ class BankDatabase:
         """)
         await conn.commit()
 
-    
-# --- UI: VC内操作パネル  ---
+# --- UI: VC内操作パネル ---
 class VCControlView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="招待するメンバーを選択...", min_values=1, max_values=10, row=0)
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="招待するメンバーを選択...", min_values=1, max_values=10, row=0, custom_id="vc_invite_select")
     async def invite_users(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
         await interaction.response.defer(ephemeral=True)
         
@@ -288,13 +287,8 @@ class VCControlView(discord.ui.View):
             return await interaction.followup.send("❌ ここはボイスチャンネルではありません。", ephemeral=True)
 
         perms = discord.PermissionOverwrite(
-            view_channel=True,
-            connect=True,
-            speak=True,
-            stream=True,
-            use_voice_activation=True,
-            send_messages=True,
-            read_message_history=True
+            view_channel=True, connect=True, speak=True, stream=True,
+            use_voice_activation=True, send_messages=True, read_message_history=True
         )
 
         added_users = []
@@ -303,31 +297,34 @@ class VCControlView(discord.ui.View):
             await channel.set_permissions(member, overwrite=perms)
             added_users.append(member.display_name)
 
-        await interaction.followup.send(f"✅ 以下のメンバーを招待しました:\n{', '.join(added_users)}", ephemeral=True)
-        await channel.send(f"👋 {interaction.user.mention} が {', '.join([m.mention for m in select.values])} を招待しました。")
+        if not added_users:
+            return await interaction.followup.send("❌ 招待できるメンバーがいませんでした。", ephemeral=True)
 
-    @discord.ui.button(label="メンバーの権限を剥奪(追放)", style=discord.ButtonStyle.danger, row=1)
+        await interaction.followup.send(f"✅ 以下のメンバーを招待しました:\n{', '.join(added_users)}", ephemeral=True)
+        await channel.send(f"👋 {interaction.user.mention} が {', '.join([m.mention for m in select.values if not m.bot])} を招待しました。")
+
+    @discord.ui.button(label="メンバーの権限を剥奪(追放)", style=discord.ButtonStyle.danger, row=1, custom_id="vc_kick_btn")
     async def kick_user_menu(self, interaction: discord.Interaction, button: discord.ui.Button):
         view = RemoveUserView()
         await interaction.response.send_message("権限を剥奪するメンバーを選んでください。", view=view, ephemeral=True)
 
 
 class RemoveUserView(discord.ui.View):
-    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="権限を剥奪するメンバーを選択...", min_values=1, max_values=10)
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="権限を剥奪するメンバーを選択...", min_values=1, max_values=10, custom_id="vc_remove_select")
     async def remove_users(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
         await interaction.response.defer(ephemeral=True)
         channel = interaction.channel
-        
+
         removed_names = []
         for member in select.values:
             if member.id == interaction.user.id: continue
             if member.bot: continue
-            
             await channel.set_permissions(member, overwrite=None)
-            
-            if member.voice and member.voice.channel.id == channel.id:
+            if member.voice and member.voice.channel and member.voice.channel.id == channel.id:
                 await member.move_to(None)
-            
             removed_names.append(member.display_name)
 
         if removed_names:
@@ -336,40 +333,37 @@ class RemoveUserView(discord.ui.View):
             await interaction.followup.send("❌ 対象を選択してください（自分自身は削除できません）。", ephemeral=True)
 
 
-# --- UI: プラン選択メニュー  ---
+# --- UI: プラン選択メニュー ---
 class PlanSelect(discord.ui.Select):
     def __init__(self, prices: dict):
         self.prices = prices
         options = [
-            discord.SelectOption(
-                label="6時間プラン", 
-                description=f"{prices.get('6', 5000):,} Stell - ちょっとした作業や会議に", 
-                value="6", emoji="🕐"
-            ),
-            discord.SelectOption(
-                label="12時間プラン", 
-                description=f"{prices.get('12', 10000):,} Stell - 半日じっくり", 
-                value="12", emoji="🕓"
-            ),
-            discord.SelectOption(
-                label="24時間プラン", 
-                description=f"{prices.get('24', 30000):,} Stell - 丸一日貸切", 
-                value="24", emoji="🕛"
-            ),
+            discord.SelectOption(label="6時間プラン",  description=f"{prices.get('6',  5000):,} Stell - ちょっとした作業や会議に", value="6",  emoji="🕐"),
+            discord.SelectOption(label="12時間プラン", description=f"{prices.get('12', 10000):,} Stell - 半日じっくり",             value="12", emoji="🕓"),
+            discord.SelectOption(label="24時間プラン", description=f"{prices.get('24', 30000):,} Stell - 丸一日貸切",               value="24", emoji="🕛"),
         ]
         super().__init__(placeholder="利用プランを選択してください...", min_values=1, max_values=1, options=options, row=0)
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        
+
         user = interaction.user
         bot = interaction.client
 
+        # ★修正①: 孤立レコードをクリーンアップしてから既存チェック
         async with bot.get_db() as db:
             async with db.execute("SELECT channel_id FROM temp_vcs WHERE owner_id = ?", (user.id,)) as cursor:
-                existing_vc = await cursor.fetchone()
-            if existing_vc:
-                return await interaction.followup.send("❌ あなたは既に一時VCを作成しています。", ephemeral=True)
+                existing = await cursor.fetchone()
+
+            if existing:
+                # チャンネルが実際に存在するか確認
+                real_channel = bot.get_channel(existing['channel_id'])
+                if real_channel is None:
+                    # 実在しない → 孤立レコードなので削除してOK
+                    await db.execute("DELETE FROM temp_vcs WHERE owner_id = ?", (user.id,))
+                    await db.commit()
+                else:
+                    return await interaction.followup.send("❌ あなたは既に一時VCを作成しています。", ephemeral=True)
 
         hours = int(self.values[0])
         price = self.prices.get(str(hours), 5000)
@@ -380,10 +374,11 @@ class PlanSelect(discord.ui.Select):
                 current_bal = row['balance'] if row else 0
 
             if current_bal < price:
-                return await interaction.followup.send(f"❌ 残高不足です。\n必要: {price:,} Stell / 所持: {current_bal:,} Stell", ephemeral=True)
+                return await interaction.followup.send(
+                    f"❌ 残高不足です。\n必要: {price:,} Stell / 所持: {current_bal:,} Stell", ephemeral=True
+                )
 
             month_tag = datetime.datetime.now().strftime("%Y-%m")
-            
             await db.execute("UPDATE accounts SET balance = balance - ? WHERE user_id = ?", (price, user.id))
             await db.execute(
                 "INSERT INTO transactions (sender_id, receiver_id, amount, type, description, month_tag) VALUES (?, 0, ?, 'VC_CREATE', ?, ?)",
@@ -394,11 +389,11 @@ class PlanSelect(discord.ui.Select):
         try:
             guild = interaction.guild
             category = interaction.channel.category
-            
+
             overwrites = {
                 guild.default_role: discord.PermissionOverwrite(view_channel=False, connect=False),
                 user: discord.PermissionOverwrite(
-                    view_channel=True, connect=True, speak=True, stream=True, 
+                    view_channel=True, connect=True, speak=True, stream=True,
                     use_voice_activation=True, send_messages=True, read_message_history=True,
                     move_members=True, mute_members=True
                 ),
@@ -420,15 +415,21 @@ class PlanSelect(discord.ui.Select):
                 await db.commit()
 
             await new_vc.send(
-                f"{user.mention} ようこそ！\nこのパネルを使って、友達を招待したり権限を管理できます。\n(時間が来るとこのチャンネルは自動消滅します)", 
+                f"{user.mention} ようこそ！\nこのパネルを使って、友達を招待したり権限を管理できます。\n(時間が来るとこのチャンネルは自動消滅します)",
                 view=VCControlView()
             )
-
-            await interaction.followup.send(f"✅ 作成完了: {new_vc.mention}\n期限: {expire_dt.strftime('%m/%d %H:%M')}\n招待機能はチャンネル内のパネルを使用してください。", ephemeral=True)
+            await interaction.followup.send(
+                f"✅ 作成完了: {new_vc.mention}\n期限: {expire_dt.strftime('%m/%d %H:%M')}\n招待機能はチャンネル内のパネルを使用してください。",
+                ephemeral=True
+            )
 
         except Exception as e:
             logger.error(f"VC Create Error: {e}")
-            await interaction.followup.send("❌ VC作成中にエラーが発生しました。", ephemeral=True)
+            # ★VC作成失敗したら引き落とした分を返金
+            async with bot.get_db() as db:
+                await db.execute("UPDATE accounts SET balance = balance + ? WHERE user_id = ?", (price, user.id))
+                await db.commit()
+            await interaction.followup.send("❌ VC作成中にエラーが発生しました。料金を返金しました。", ephemeral=True)
 
 
 class VCPanel(discord.ui.View):
@@ -445,9 +446,9 @@ class VCPanel(discord.ui.View):
                 for row in rows:
                     prices[row['key'].replace('vc_price_', '')] = int(row['value'])
 
-        if '6' not in prices: prices['6'] = 5000
-        if '12' not in prices: prices['12'] = 10000
-        if '24' not in prices: prices['24'] = 30000
+        if '6'  not in prices: prices['6']  = 30000
+        if '12' not in prices: prices['12'] = 50000
+        if '24' not in prices: prices['24'] = 80000
 
         view = discord.ui.View()
         view.add_item(PlanSelect(prices))
@@ -468,19 +469,29 @@ class PrivateVCManager(commands.Cog):
         now = datetime.datetime.now()
         try:
             async with self.bot.get_db() as db:
-                async with db.execute("SELECT channel_id, guild_id FROM temp_vcs WHERE expire_at < ?", (now,)) as cursor:
-                    expired_vcs = await cursor.fetchall()
+                async with db.execute("SELECT channel_id, guild_id FROM temp_vcs") as cursor:
+                    all_vcs = await cursor.fetchall()
 
-                if not expired_vcs: return
+                if not all_vcs: return
 
-                for row in expired_vcs:
+                for row in all_vcs:
                     c_id = row['channel_id']
                     channel = self.bot.get_channel(c_id)
-                    if channel:
-                        try:
-                            await channel.delete(reason="Temp VC Expired")
-                        except: pass
-                    await db.execute("DELETE FROM temp_vcs WHERE channel_id = ?", (c_id,))
+
+                    # ★修正①: チャンネルが存在しない（手動削除済み）or 期限切れ → どちらも削除
+                    if channel is None:
+                        await db.execute("DELETE FROM temp_vcs WHERE channel_id = ?", (c_id,))
+                    else:
+                        async with db.execute("SELECT expire_at FROM temp_vcs WHERE channel_id = ?", (c_id,)) as c:
+                            rec = await c.fetchone()
+                        if rec:
+                            expire_at = datetime.datetime.fromisoformat(str(rec['expire_at']))
+                            if now >= expire_at:
+                                try:
+                                    await channel.delete(reason="Temp VC Expired")
+                                except: pass
+                                await db.execute("DELETE FROM temp_vcs WHERE channel_id = ?", (c_id,))
+
                 await db.commit()
         except Exception as e:
             logger.error(f"Expiration Check Error: {e}")
@@ -499,20 +510,19 @@ class PrivateVCManager(commands.Cog):
     )
     @has_permission("ADMIN")
     async def deploy_panel(
-        self, 
-        interaction: discord.Interaction, 
-        title: str = "🔒 プライベート一時VC作成パネル", 
-        description: str = None, 
-        price_6h: int = 5000, 
-        price_12h: int = 10000, 
+        self,
+        interaction: discord.Interaction,
+        title: str = "アパホテル",
+        description: str = None,
+        price_6h: int = 5000,
+        price_12h: int = 10000,
         price_24h: int = 30000
     ):
-        
         await interaction.response.defer(ephemeral=True)
 
         if description is None:
             description = (
-                "権限のある人以外からは見えない、プライベートな一時VCを作成できます。\n\n"
+                "権限のある人以外からは見えない、プライベートな一時VCを作成できます。ようこそアパホテルへ\n\n"
                 "**🔒 プライバシー**\n招待した人以外は見えません\n"
                 "**🛡 料金システム**\n作成時に自動引き落とし\n"
                 f"**⏰ 料金プラン**\n"
@@ -524,16 +534,18 @@ class PrivateVCManager(commands.Cog):
             description = description.replace("\\n", "\n")
 
         async with self.bot.get_db() as db:
-            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES ('vc_price_6', ?)", (str(price_6h),))
+            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES ('vc_price_6', ?)",  (str(price_6h),))
             await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES ('vc_price_12', ?)", (str(price_12h),))
             await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES ('vc_price_24', ?)", (str(price_24h),))
             await db.commit()
 
         embed = discord.Embed(title=title, description=description, color=0x2b2d31)
         embed.set_footer(text=f"Last Updated: {datetime.datetime.now().strftime('%Y/%m/%d %H:%M')}")
-        
+
         await interaction.channel.send(embed=embed, view=VCPanel())
         await interaction.followup.send("✅ 設定を保存し、パネルを設置しました。", ephemeral=True)
+
+
 
 class TransferConfirmView(discord.ui.View):
     def __init__(self, bot, sender, receiver, amount, message):
