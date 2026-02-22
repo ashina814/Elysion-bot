@@ -2154,7 +2154,7 @@ class Chinchiro(commands.Cog):
         # 場所代引き落とし
         async with self.bot.get_db() as db:
             await cesta_cog.sub_balance(db, user.id, bet + venue_fee)
-                newly = await cesta_cog.record_spend(db, user.id, bet + venue_fee)
+            newly = await cesta_cog.record_spend(db, user.id, bet + venue_fee)
             await db.commit()
 
         embed = discord.Embed(
@@ -2168,6 +2168,7 @@ class Chinchiro(commands.Cog):
         )
         await interaction.response.defer()
         msg = await interaction.followup.send(embed=embed)
+
 
         # ── プレイヤーのションベンチェック ──
         player_shonben = random.random() < self.SHONBEN_RATE
@@ -2645,11 +2646,13 @@ class SlotMachine(commands.Cog):
 
         async with self.bot.get_db() as db:
             ok = await cesta.sub_balance(db, user_id, bet)
-                newly = await cesta.record_spend(db, user_id, bet)
+            newly = await cesta.record_spend(db, user_id, bet)
+
             if not ok:
                 return await interaction.edit_original_response(
                     content="❌ セスタ残高が不足しています。", view=None
                 )
+
             if payout > 0:
                 await cesta.add_balance(db, user_id, payout)
 
