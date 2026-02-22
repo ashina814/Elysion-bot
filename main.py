@@ -1483,11 +1483,11 @@ def solo_reward_mult(mult):
     目あり→x1.2 / ヒフミで勝ち→x1.1
     場所代2%と合わせて期待値≒95%
     """
-    if mult == 5:    return 1.9
-    if mult == 3:    return 1.7
-    if mult == 2:    return 1.4
-    if mult is None: return 1.2
-    if mult == -1:   return 1.1
+    if mult == 5:    return 3.3
+    if mult == 3:    return 2.7
+    if mult == 2:    return 2.2
+    if mult is None: return 1.7
+    if mult == -1:   return 1.4
     return 1.0
 
 # ================================================================
@@ -1684,25 +1684,17 @@ class ChinchiroRecruitView(discord.ui.View):
         user = interaction.user
 
         if s.phase != "recruiting":
-            return await interaction.response.send_message(
-                "もう始まってるじゃん", ephemeral=True
-            )
+            return await interaction.response.send_message("もう始まってるじゃん", ephemeral=True)
         if user.id == s.host.id:
-            return await interaction.response.send_message(
-                "アンタが親じゃん", ephemeral=True
-            )
+            return await interaction.response.send_message("アンタが親じゃん", ephemeral=True)
         if any(p.id == user.id for p in s.players):
-            return await interaction.response.send_message(
-                "もう入ってるじゃん", ephemeral=True
-            )
+            return await interaction.response.send_message("もう入ってるじゃん", ephemeral=True)
         if len(s.players) >= 7:
-            return await interaction.response.send_message(
-                "満員じゃん", ephemeral=True
-            )
+            return await interaction.response.send_message("満員じゃん", ephemeral=True)
 
         venue_fee = int(s.bet * Chinchiro.VENUE_RATE)
-        cesta     = self.cog.bot.get_cog("CestaSystem")
-        bal       = await cesta.get_balance(user.id)
+        async with self.cog.bot.get_db() as db:
+            bal = await self.cog._get_stell(db, user.id)
         if bal < s.bet + venue_fee:
             return await interaction.response.send_message(
                 f"セスタ「{c_line('broke')}」", ephemeral=True
@@ -1765,16 +1757,26 @@ class ChinchiroRecruitView(discord.ui.View):
 #  Cog: Chinchiro
 # ================================================================
 
+
 class Chinchiro(commands.Cog):
 
     COOLDOWN_SECONDS = 30
-    VENUE_RATE       = 0.03   # 場所代3% Burn
-    SHONBEN_RATE     = 0.03   # ションベン確率3%
+    VENUE_RATE       = 0.03
+    SHONBEN_RATE     = 0.03
+
+    BET_CHOICES = [
+        app_commands.Choice(name="1000 Stell",     value=1000),
+        app_commands.Choice(name="5000 Stell",     value=5000),
+        app_commands.Choice(name="10,000 Stell",   value=10000),
+        app_commands.Choice(name="30,000 Stell",   value=30000),
+        app_commands.Choice(name="50,000 Stell",  value=50000),
+        app_commands.Choice(name="100,000 Stell", value=100000),
+    ]
 
     def __init__(self, bot):
-        self.bot      = bot
-        self.sessions : dict = {}   # channel_id -> ChinchiroSession
-        self.cooldowns: dict = {}   # user_id -> datetime
+        self.bot       = bot
+        self.sessions  : dict = {}
+        self.cooldowns : dict = {}
 
     def _check_cd(self, user_id) -> int | None:
         if user_id in self.cooldowns:
@@ -1785,19 +1787,34 @@ class Chinchiro(commands.Cog):
                 return int(rem) + 1
         return None
 
-    async def _get_cesta(self, user_id: int) -> int:
-        return await self.bot.get_cog("CestaSystem").get_balance(user_id)
+    async def _get_stell(self, db, user_id: int) -> int:
+        async with db.execute(
+            "SELECT balance FROM accounts WHERE user_id = ?", (user_id,)
+        ) as c:
+            row = await c.fetchone()
+        return row["balance"] if row else 0
+
+    async def _add_stell(self, db, user_id: int, amount: int):
+        await db.execute("""
+            INSERT INTO accounts (user_id, balance, total_earned)
+            VALUES (?, ?, 0)
+            ON CONFLICT(user_id) DO UPDATE SET balance = balance + excluded.balance
+        """, (user_id, amount))
+
+    async def _sub_stell(self, db, user_id: int, amount: int) -> bool:
+        bal = await self._get_stell(db, user_id)
+        if bal < amount:
+            return False
+        await db.execute(
+            "UPDATE accounts SET balance = balance - ? WHERE user_id = ?",
+            (amount, user_id)
+        )
+        return True
 
     # ── /チンチロ ─────────────────────────────────────────
-    @app_commands.command(name="チンチロ", description="チンチロの親になってゲームを開始します")
-    @app_commands.describe(bet="賭け金（セスタ）")
-    @app_commands.choices(bet=[
-        app_commands.Choice(name="1 セスタ",   value=1),
-        app_commands.Choice(name="5 セスタ",   value=5),
-        app_commands.Choice(name="10 セスタ",  value=10),
-        app_commands.Choice(name="50 セスタ",  value=50),
-        app_commands.Choice(name="100 セスタ", value=100),
-    ])
+    @app_commands.command(name="チンチロ", description="チンチロの親になってゲームを開始します（Stell）")
+    @app_commands.describe(bet="賭け金（Stell）")
+    @app_commands.choices(bet=BET_CHOICES)
     async def chinchiro_start(self, interaction: discord.Interaction, bet: int):
         ch_id = interaction.channel_id
         user  = interaction.user
@@ -1816,7 +1833,8 @@ class Chinchiro(commands.Cog):
             )
 
         venue_fee = int(bet * self.VENUE_RATE)
-        bal       = await self._get_cesta(user.id)
+        async with self.bot.get_db() as db:
+            bal = await self._get_stell(db, user.id)
         if bal < bet + venue_fee:
             return await interaction.response.send_message(
                 f"セスタ「{c_line('broke')}」", ephemeral=True
@@ -1829,7 +1847,7 @@ class Chinchiro(commands.Cog):
         embed.description = (
             f"セスタ「{c_line('start')}」\n\n"
             f"**親:** {user.mention}\n"
-            f"**賭け金:** {bet:,} セスタ　**場所代:** {venue_fee:,} セスタ/人（Burn）\n\n"
+            f"**賭け金:** {bet:,} Stell　**場所代:** {venue_fee:,} Stell/人（Burn）\n\n"
             f"参加者: なし\n\n"
             f"**参加する** ボタンで子として参加！\n"
             f"最大7人まで / 120秒で自動終了"
@@ -1842,13 +1860,14 @@ class Chinchiro(commands.Cog):
         bet         = s.bet
         venue_fee   = int(bet * self.VENUE_RATE)
         all_members = [s.host] + s.players
-        cesta_cog   = self.bot.get_cog("CestaSystem")
 
-        # 残高チェック
+        # 残高チェック（Stell）
         broke = []
-        for m in all_members:
-            if await cesta_cog.get_balance(m.id) < bet + venue_fee:
-                broke.append(m)
+        async with self.bot.get_db() as db:
+            for m in all_members:
+                bal = await self._get_stell(db, m.id)
+                if bal < bet + venue_fee:
+                    broke.append(m)
         if broke:
             s.phase = "recruiting"
             return await interaction.channel.send(
@@ -1856,15 +1875,15 @@ class Chinchiro(commands.Cog):
                 f"セスタ「{c_line('broke')}」"
             )
 
-        # 全員から引く
+        # 全員からStell引き落とし
         async with self.bot.get_db() as db:
             for m in all_members:
-                await cesta_cog.sub_balance(db, m.id, bet + venue_fee)
-                newly = await cesta.record_spend(db, m.id, bet + venue_fee)
+                await self._sub_stell(db, m.id, bet + venue_fee)
             await db.commit()
 
         total_burn = venue_fee * len(all_members)
         month_tag  = datetime.datetime.now().strftime("%Y-%m")
+        num_children = len(s.players)
 
         # ── 親のサイコロ演出 ──────────────────────────────
         embed = discord.Embed(
@@ -1874,35 +1893,30 @@ class Chinchiro(commands.Cog):
         )
         msg = await interaction.channel.send(embed=embed)
 
-        # ションベンチェック（1投目）
+        # 親ションベンチェック
         host_shonben = random.random() < self.SHONBEN_RATE
-
         if host_shonben:
             await asyncio.sleep(0.8)
             embed.description = (
                 f"**親:** {s.host.mention}\n\n"
-                f"🎲 {dice_str([random.randint(1,6) for _ in range(3)])}  ← 飛んだ！\n\n"
+                f"🎲 {dice_str([random.randint(1,6) for _ in range(3)])} ← 飛んだ！\n\n"
                 f"💦 **ションベン！** 親の即負け！\n"
                 f"セスタ「{c_line('shonben_fly')}」"
             )
             embed.color = 0x4444ff
             await msg.edit(embed=embed)
 
-            # 全員に賭け金返却＋子に配当
+            # 子全員に bet×2 返却（Stell）
             async with self.bot.get_db() as db:
-                # 親は賭け金没収（ションベン=親の負け）
                 for m in s.players:
-                    win_amt = bet * 2
-                    await cesta_cog.add_balance(db, m.id, win_amt)
-                # 親は賭け金没収のまま（返却なし）
+                    await self._add_stell(db, m.id, bet * 2)
                 await db.commit()
 
-            if ch_id := s.channel_id:
-                if ch_id in self.sessions:
-                    del self.sessions[ch_id]
             now = datetime.datetime.now()
             for m in all_members:
                 self.cooldowns[m.id] = now
+            if s.channel_id in self.sessions:
+                del self.sessions[s.channel_id]
             return
 
         # 通常の親のロール
@@ -1910,8 +1924,8 @@ class Chinchiro(commands.Cog):
             msg, embed, s.host, is_host=True
         )
 
-        # ── 子のサイコロ演出（順番に）──────────────────────
-        results      = {}
+        # ── 子のサイコロ演出 ──────────────────────────────
+        results        = {}
         child_shonbens = {}
 
         for m in s.players:
@@ -1925,18 +1939,22 @@ class Chinchiro(commands.Cog):
                 )
                 results[m.id] = (rolls, rname, score, mult)
 
-        # ── 精算 ──────────────────────────────────────────
+        # ── 精算（ゼロサム・Stell）────────────────────────
+        # C案: 子が勝ったとき払い出し額 = min(bet*役倍率, 親のbet)
+        # 参加者が多いほど親のbetプールが増えて高倍率が意味を持つ
         win_members  = []
         lose_members = []
         draw_members = []
         child_lines  = []
+
+        # 親が勝った子から受け取れる額のプール
+        host_pool = bet * num_children  # 子全員のbet合計
 
         async with self.bot.get_db() as db:
             for m in s.players:
                 rolls, role_name, score, mult = results[m.id]
 
                 if child_shonbens[m.id]:
-                    # ションベン → 即負け
                     child_lines.append(
                         f"💦 {m.mention} **ションベン！** 即負け\n"
                         f"セスタ「{c_line('shonben_fly')}」"
@@ -1945,48 +1963,55 @@ class Chinchiro(commands.Cog):
                     continue
 
                 outcome = determine_outcome(h_mult, h_score, mult, score)
-
-                parts = []
+                parts   = []
                 for i, r in enumerate(rolls):
                     suffix = f"**{role_name}**" if i == len(rolls)-1 else "ハチ目"
                     parts.append(f"　{i+1}投目: {dice_str(r)} {suffix}")
                 roll_disp = "\n".join(parts)
 
                 if outcome == "child_win":
-                    win_amt = bet * pvp_payout_mult(mult)
-                    await cesta_cog.add_balance(db, m.id, bet + win_amt)
+                    # 払い出し = bet + min(bet×役倍率, 親のpool残り)
+                    raw_win   = bet * pvp_payout_mult(mult)
+                    actual_win = min(raw_win, host_pool)
+                    host_pool -= actual_win
+                    payout    = bet + actual_win
+                    await self._add_stell(db, m.id, payout)
                     child_lines.append(
-                        f"✅ {m.mention}\n{roll_disp}\n　→ **子の勝ち！** +{win_amt:,} セスタ"
+                        f"✅ {m.mention}\n{roll_disp}\n"
+                        f"　→ **子の勝ち！** +{actual_win:,} Stell"
                     )
-                    win_members.append((m, mult, win_amt))
+                    win_members.append((m, mult, actual_win))
+
                 elif outcome == "host_win":
                     child_lines.append(
                         f"❌ {m.mention}\n{roll_disp}\n　→ **親の勝ち**"
                     )
                     lose_members.append(m)
+
                 else:
-                    await cesta_cog.add_balance(db, m.id, bet)
+                    await self._add_stell(db, m.id, bet)
                     child_lines.append(
                         f"🟡 {m.mention}\n{roll_disp}\n　→ **引き分け**（返却）"
                     )
                     draw_members.append(m)
 
             # 親の精算
-            host_profit = sum(win_amt for _, _, win_amt in win_members) * -1
-            host_profit += bet * len(lose_members)
-            parent_return = bet + host_profit
-            if parent_return > 0:
-                await cesta_cog.add_balance(db, s.host.id, parent_return)
+            # 親の受け取り = 元本 + 負けた子のbet - 勝った子に払った額
+            total_won  = sum(w for _, _, w in win_members)
+            total_lost = len(lose_members) * bet
+            host_return = bet + total_lost - total_won
+            if host_return > 0:
+                await self._add_stell(db, s.host.id, host_return)
 
             await db.commit()
 
         # ── 結果Embed ─────────────────────────────────────
-        if win_members and any(m == 5 for _, m, _ in win_members):
+        if not win_members and not draw_members:
+            key = "host_sweep"
+        elif win_members and not lose_members:
             key = "child_win"
-        elif h_mult == 5:                              key = "child_win"
-        elif not win_members and not draw_members:     key = "host_sweep"
-        elif win_members and not lose_members:         key = "child_win"
-        else:                                          key = "host_win_partial"
+        else:
+            key = "host_win_partial"
 
         h_parts = []
         for i, r in enumerate(h_rolls):
@@ -2006,16 +2031,19 @@ class Chinchiro(commands.Cog):
         for line in child_lines:
             result_embed.add_field(name="\u200b", value=line, inline=False)
 
+        host_profit = total_lost - total_won
+        profit_str  = f"+{host_profit:,}" if host_profit >= 0 else f"{host_profit:,}"
         summary = []
         if win_members:  summary.append("✅ 勝ち: " + ", ".join(m.display_name for m, _, _ in win_members))
         if lose_members: summary.append("❌ 負け: " + ", ".join(m.display_name for m in lose_members))
         if draw_members: summary.append("🟡 引き分け: " + ", ".join(m.display_name for m in draw_members))
-        profit_str = f"+{host_profit:,}" if host_profit >= 0 else f"{host_profit:,}"
-        summary.append(f"\n👑 親（{s.host.display_name}）収支: **{profit_str} セスタ**")
-        summary.append(f"🏛️ 場所代Burn: **{total_burn:,} セスタ**")
+        summary.append(f"\n👑 親（{s.host.display_name}）収支: **{profit_str} Stell**")
+        summary.append(f"🏛️ 場所代Burn: **{total_burn:,} Stell**")
 
         result_embed.add_field(name="📊 収支", value="\n".join(summary), inline=False)
-        result_embed.set_footer(text=f"賭け金: {bet:,} セスタ | 場所代: {venue_fee:,} セスタ/人")
+        result_embed.set_footer(
+            text=f"賭け金: {bet:,} Stell | 場所代: {venue_fee:,} Stell/人"
+        )
         await msg.edit(embed=result_embed)
 
         now = datetime.datetime.now()
@@ -2023,63 +2051,6 @@ class Chinchiro(commands.Cog):
             self.cooldowns[m.id] = now
         if s.channel_id in self.sessions:
             del self.sessions[s.channel_id]
-
-    # ── サイコロアニメーション ────────────────────────────
-    async def _animated_roll(
-        self, msg, embed, member, is_host: bool,
-        host_role: str = ""
-    ):
-        label = f"👑 親: {member.display_name}" if is_host else f"🎲 {member.display_name}"
-
-        rolls, role_name, score, mult = roll_until_role()
-        all_parts = []
-
-        for i, dice in enumerate(rolls):
-            is_last   = (i == len(rolls) - 1)
-            role_str  = judge_roll(dice)
-            _, _, tmp_mult = role_str if len(role_str) == 3 else ("", 0, 0)
-
-            # セリフ選択
-            if i == 0:
-                if random.random() < self.SHONBEN_RATE * 0.3:
-                    selife = c_line("roll1_hachi")
-                else:
-                    _, _, m0 = judge_roll(dice)
-                    if m0 == 0:   selife = c_line("roll1_hachi")
-                    elif m0 == -1: selife = c_line("roll1_hifumi")
-                    else:          selife = c_line("roll1_good")
-            elif i == 1:
-                _, _, m1 = judge_roll(dice)
-                prev_dice = rolls[0]
-                pe        = prev_dice
-                ce        = dice
-                if m1 == 0:
-                    selife = c_line("roll2_hachi")
-                elif any(ce.count(v) >= 2 for v in ce):
-                    selife = c_line("roll2_reach")
-                else:
-                    selife = c_line("roll2_good")
-            else:
-                if mult == 5:      selife = c_line("roll3_pinzoro")
-                elif mult == 2:    selife = c_line("roll3_shigoro")
-                elif mult == 3:    selife = c_line("roll3_zorume")
-                elif mult is None: selife = c_line("roll3_miari")
-                elif mult == -1:   selife = c_line("roll3_hifumi")
-                else:              selife = c_line("roll3_shonben")
-
-            suffix = f"**{role_name}**" if is_last else "ハチ目"
-            all_parts.append(f"　{i+1}投目: {dice_str(dice)} {suffix}")
-
-            # Embed更新
-            disp = "\n".join(all_parts)
-            embed.description = (
-                f"{label}\n\n{disp}\n\n"
-                f"セスタ「{selife}」"
-            )
-            await msg.edit(embed=embed)
-            await asyncio.sleep(1.0)
-
-        return rolls, role_name, score, mult
 
     # ── /チンチロ解散 ──────────────────────────────────────
     @app_commands.command(name="チンチロ解散", description="開催中のゲームを解散します")
