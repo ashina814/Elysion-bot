@@ -1294,7 +1294,922 @@ class Jackpot(commands.Cog):
 
         await interaction.followup.send(content="@everyone", embed=embed)
 
+# ============================================================
+#  Chinchiro Cog  ―  PVP親子対戦 + PVEレイド（vsセスタ）
+#
+#  【お金の流れ】
+#  ■ PVP（/チンチロ開始）
+#    ・場所代: 賭け金の5% × 全員 → Burn
+#    ・勝敗はPVP（親子間のやりとり）
+#    ・JPへの積み立てなし
+#
+#  ■ PVEレイド（/チンチロレイド）
+#    ・場所代: 賭け金の5% × 全員 → Burn
+#    ・負け分: 5% → JP積み立て、95% → Burn
+#    ・勝者報酬: 役に応じた倍率（最大x2、インフレ抑制設計）
+#
+#  【導入】古いChinchiroクラスをこれに差し替え。
+#          冒頭のヘルパー関数も一緒に貼る。
+# ============================================================
 
+# ========== ヘルパー関数 ==========
+
+DICE_EMOJI = {1:"⚀", 2:"⚁", 3:"⚂", 4:"⚃", 5:"⚄", 6:"⚅"}
+
+def dice_str(dice):
+    return " ".join(DICE_EMOJI[d] for d in dice)
+
+def judge_roll(dice):
+    """
+    Returns (role_name, score, mult)
+    5=ピンゾロ / 3=ゾロ目 / 2=シゴロ / None=目あり / -1=ヒフミ / 0=ハチ目
+    """
+    d = sorted(dice)
+    counts = {v: dice.count(v) for v in set(dice)}
+    if d == [1,1,1]:         return ("🌟 ピンゾロ！",     100,        5)
+    if len(counts) == 1:     return (f"✨ ゾロ目({d[0]})", d[0]*10+50, 3)
+    if d == [4,5,6]:         return ("🔥 シゴロ！",        99,         2)
+    if d == [1,2,3]:         return ("💀 ヒフミ…",         -1,        -1)
+    if 2 in counts.values():
+        for v, c in counts.items():
+            if c == 1:
+                return (f"🎯 目あり({v})", v, None)
+    return ("😶 ハチ目", 0, 0)
+
+def roll_until_role(max_tries=3):
+    """役が出るまで最大3回。Returns (all_rolls, role_name, score, mult)"""
+    all_rolls = []
+    role_name, score, mult = "😶 ハチ目", 0, 0
+    for _ in range(max_tries):
+        dice = [random.randint(1,6) for _ in range(3)]
+        all_rolls.append(dice)
+        role_name, score, mult = judge_roll(dice)
+        if mult != 0:
+            break
+    return all_rolls, role_name, score, mult
+
+def score_rank(mult, score):
+    if mult == 5:    return (5, score)
+    if mult == 3:    return (3, score)
+    if mult == 2:    return (2, score)
+    if mult is None: return (1, score)
+    if mult == -1:   return (-1, 0)
+    return (0, 0)
+
+def determine_outcome(h_mult, h_score, c_mult, c_score):
+    """子から見た勝敗。'child_win'/'host_win'/'draw'"""
+    h = score_rank(h_mult, h_score)
+    c = score_rank(c_mult, c_score)
+    if c > h: return "child_win"
+    if c < h: return "host_win"
+    return "draw"
+
+def pvp_payout_mult(mult):
+    """PVP: 勝ったときの純利益倍率"""
+    if mult == 5: return 5
+    if mult == 3: return 3
+    if mult == 2: return 2
+    return 1
+
+def raid_reward_mult(mult):
+    """
+    レイド: セスタに勝ったときの賭け金に対する返却倍率（純利益込み）
+    インフレ抑制のため上限x2。ハチ目引き分けは賭け金のみ返却。
+    ピンゾロ → x2.0 / ゾロ目 → x1.8 / シゴロ → x1.5
+    目あり   → x1.3 / ヒフミで勝ち（セスタがヒフミ）→ x1.2
+    """
+    if mult == 5:    return 2.0   # ピンゾロ
+    if mult == 3:    return 1.8   # ゾロ目
+    if mult == 2:    return 1.5   # シゴロ
+    if mult is None: return 1.3   # 目あり
+    if mult == -1:   return 1.2   # ヒフミで勝ち
+    return 1.0                    # 引き分け（賭け金返却のみ）
+
+# ========== セッション ==========
+
+class ChinchiroSession:
+    """PVP用セッション"""
+    def __init__(self, host, bet, channel_id):
+        self.host       = host
+        self.bet        = bet
+        self.channel_id = channel_id
+        self.players    = []
+        self.phase      = "recruiting"
+        self.started_at = datetime.datetime.now()
+
+class RaidSession:
+    """PVEレイド用セッション"""
+    def __init__(self, bet, channel_id):
+        self.bet        = bet
+        self.channel_id = channel_id
+        self.players    = []
+        self.phase      = "recruiting"
+        self.started_at = datetime.datetime.now()
+
+# ========== Cog 本体 ==========
+
+class Chinchiro(commands.Cog):
+
+    COOLDOWN_SECONDS  = 30
+    MAX_PLAYERS_PVP   = 8     # 親含む
+    MAX_PLAYERS_RAID  = 10    # セスタ除く
+    RECRUIT_TIMEOUT   = 120
+    VENUE_RATE        = 0.05  # 場所代（全員Burn）
+    RAID_JP_RATE      = 0.05  # レイド負け分のJP積み立て率
+
+    BET_CHOICES = [
+        app_commands.Choice(name="100 Stell",    value=100),
+        app_commands.Choice(name="500 Stell",    value=500),
+        app_commands.Choice(name="1,000 Stell",  value=1000),
+        app_commands.Choice(name="3,000 Stell",  value=3000),
+        app_commands.Choice(name="5,000 Stell",  value=5000),
+        app_commands.Choice(name="10,000 Stell", value=10000),
+    ]
+
+    # ============================================================
+    #  セスタのセリフ集
+    #  上から目線・詰めが甘い・ポロッと本音・毒舌だけど憎めない
+    # ============================================================
+    SESTA_LINES = {
+        "start": [
+            "セスタ「チンチロ？……まぁ、いいけど。場所代はちゃんともらうから」",
+            "セスタ「あんたたちが転がすの見てあげる。感謝してよね」",
+            "セスタ「どうせ負けるくせに。……でも見てないと心配だから、仕方なく仕切る」",
+        ],
+        "join": [
+            "セスタ「また来た。好きにしなよ」",
+            "セスタ「参加者が増えたじゃん。……まぁ、来てくれるのは悪くないけど」",
+            "セスタ「あんたも？……うん、まぁ、来るなとは言ってない」",
+        ],
+        "rolling": [
+            "セスタ「さっさと振りなよ。私が待ってる時間、もったいないから」",
+            "セスタ「……緊張してんの？別にいいけど、早く」",
+            "セスタ「振れば？……応援とかしないけど、まぁ、いい目出るといいね」",
+        ],
+        "pinzoro_host": [
+            "セスタ「ピンゾロ。……まぁ、親が強いのは当然でしょ」",
+            "セスタ「ピンゾロじゃん。子のみんな……気の毒だけど、これが勝負だから」",
+        ],
+        "pinzoro_child": [
+            "セスタ「ピンゾロ出たじゃん。……ちゃんと見てたよ、一応」",
+            "セスタ「え、ピンゾロ？……やるじゃん。言ってなかったけど、期待してたから」",
+        ],
+        "shigoro_host": [
+            "セスタ「シゴロ。親が強いとゲームになんないんだけど。……でも、まぁいい目だった」",
+        ],
+        "hifumi_host": [
+            "セスタ「ヒフミ。……次は頑張って」",
+            "セスタ「ヒフミかぁ。……ま、誰でもある。気にしないで」",
+        ],
+        "hachimai_host": [
+            "セスタ「3回ともハチ目。……珍しいね。引き分けでよかったじゃん」",
+            "セスタ「ハチ目3連続。……なんか、お疲れ様って感じ」",
+        ],
+        "child_win": [
+            "セスタ「子が勝った。……まぁ、よくやった」",
+            "セスタ「勝ったじゃん。……素直に認める、よかった」",
+        ],
+        "host_sweep": [
+            "セスタ「親の勝ち。……負けた人、まぁ次があるから」",
+            "セスタ「全滅じゃん。……親が強かっただけで、みんなは悪くなかった」",
+        ],
+        "draw": [
+            "セスタ「引き分け。……賭け金返るし、悪くないんじゃない」",
+        ],
+        "timeout": [
+            "セスタ「……誰も来なかった。別にいいけど」",
+            "セスタ「タイムアウト。……待ってたわけじゃないから」",
+        ],
+        "broke": [
+            "セスタ「残高足りてないじゃん。稼いできなよ」",
+            "セスタ「お金ないの？……まぁ、出直してきなよ」",
+        ],
+        "cooldown": [
+            "セスタ「まだ早い。{sec}秒待って」",
+            "セスタ「{sec}秒後にまた来て。……急かさないで」",
+        ],
+        # ---- レイド専用 ----
+        "raid_start": [
+            "セスタ「レイド？……私が相手してあげる。覚悟はいい？」",
+            "セスタ「みんなで私に挑むの。……面白いじゃん、来なよ」",
+            "セスタ「私を倒せると思ってるわけ。……まぁ、やってみなよ」",
+        ],
+        "raid_join": [
+            "セスタ「また挑戦者。……まぁ、来るのは勝手だけど」",
+            "セスタ「参加するの？……負けても知らないけど、歓迎する」",
+        ],
+        "raid_rolling": [
+            "セスタ「私のサイコロ、見てなよ。……手加減はしないから」",
+            "セスタ「本気で来なよ。……私も、本気でいくから」",
+            "セスタ「さぁ、始めよ。……負けてもちゃんと慰めてあげるから」",
+        ],
+        "raid_sesta_strong": [
+            "セスタ「これが私の実力。……まぁ、頑張ったじゃん、みんな」",
+            "セスタ「どう？強かったでしょ。……全滅させたかったわけじゃないけど」",
+        ],
+        "raid_sesta_weak": [
+            "セスタ「……負けた。別に、悔しくないけど」",
+            "セスタ「やるじゃん。……今日は調子悪かっただけだから」",
+            "セスタ「勝ったの？……まぁ、認める。ちゃんと強かった」",
+        ],
+        "raid_partial": [
+            "セスタ「勝った人もいたじゃん。……残りは、次は頑張って」",
+            "セスタ「分かれたね。……勝った人はよかった、負けた人はお疲れ様」",
+        ],
+        "raid_all_lose": [
+            "セスタ「全滅。……でもよく挑んだと思う、本当に」",
+            "セスタ「誰も勝てなかった。……次は勝てるよ、たぶん」",
+        ],
+        "raid_all_win": [
+            "セスタ「……全員勝ったじゃん。やるじゃん、みんな」",
+            "セスタ「全滅させられた。……悔しいけど、強かったから仕方ない」",
+        ],
+        "raid_pinzoro_sesta": [
+            "セスタ「ピンゾロ。……これは、仕方ない」",
+        ],
+        "raid_hifumi_sesta": [
+            "セスタ「ヒフミ。……見なかったことにしてほしいんだけど」",
+            "セスタ「ヒフミじゃん。……今日はここまで、解散」",
+        ],
+    }
+
+    def __init__(self, bot):
+        self.bot          = bot
+        self.sessions     : dict = {}       # channel_id -> ChinchiroSession (PVP)
+        self.raid_sessions: dict = {}       # channel_id -> RaidSession (PVE)
+        self.cooldowns    : dict = {}       # user_id -> datetime
+
+    def sesta(self, key: str, **kwargs) -> str:
+        line = random.choice(self.SESTA_LINES.get(key, ["セスタ「……」"]))
+        return line.format(**kwargs) if kwargs else line
+
+    # ---- DB ユーティリティ ----
+    async def ensure_account(self, db, user_id):
+        await db.execute(
+            "INSERT OR IGNORE INTO accounts (user_id, balance, total_earned) VALUES (?,0,0)",
+            (user_id,)
+        )
+
+    async def get_balance(self, db, user_id) -> int:
+        async with db.execute("SELECT balance FROM accounts WHERE user_id=?", (user_id,)) as c:
+            row = await c.fetchone()
+            return row['balance'] if row else 0
+
+    async def add_to_jackpot(self, db, amount: int):
+        if amount <= 0: return
+        await db.execute("""
+            INSERT INTO server_config (key, value) VALUES ('jackpot_pool', ?)
+            ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?
+        """, (amount, amount))
+
+    def check_cooldown(self, user_id) -> int | None:
+        if user_id in self.cooldowns:
+            elapsed = (datetime.datetime.now() - self.cooldowns[user_id]).total_seconds()
+            rem = self.COOLDOWN_SECONDS - elapsed
+            if rem > 0: return int(rem) + 1
+        return None
+
+    @app_commands.command(name="チンチロ開始", description="チンチロの親になってゲームを開始します。")
+    @app_commands.describe(bet="賭け金を選んでください")
+    @app_commands.choices(bet=BET_CHOICES)
+    async def chinchiro_start(self, interaction: discord.Interaction, bet: int):
+        ch_id = interaction.channel_id
+        user  = interaction.user
+
+        if ch_id in self.sessions:
+            s = self.sessions[ch_id]
+            return await interaction.response.send_message(
+                f"❌ **{s.host.display_name}** が既にゲームを開いています。",
+                ephemeral=True
+            )
+        if ch_id in self.raid_sessions:
+            return await interaction.response.send_message(
+                "❌ このチャンネルではレイドが進行中です。", ephemeral=True
+            )
+
+        rem = self.check_cooldown(user.id)
+        if rem:
+            return await interaction.response.send_message(
+                self.sesta("cooldown", sec=rem), ephemeral=True
+            )
+
+        venue_fee    = int(bet * self.VENUE_RATE)
+        total_needed = bet + venue_fee
+
+        async with self.bot.get_db() as db:
+            await self.ensure_account(db, user.id)
+            if await self.get_balance(db, user.id) < total_needed:
+                return await interaction.response.send_message(
+                    self.sesta("broke"), ephemeral=True
+                )
+
+        self.sessions[ch_id] = ChinchiroSession(host=user, bet=bet, channel_id=ch_id)
+
+        embed = discord.Embed(title="🎲 チンチロ 参加者募集中！", color=0xff00ff)
+        embed.description = (
+            f"{self.sesta('start')}\n\n"
+            f"**親:** {user.mention}\n"
+            f"**賭け金:** {bet:,} Stell　**場所代:** {venue_fee:,} Stell/人（Burn）\n\n"
+            f"`/チンチロ参加` で子として参加！\n"
+            f"最大 **{self.MAX_PLAYERS_PVP-1}人** まで / **{self.RECRUIT_TIMEOUT}秒** で自動終了\n"
+            f"準備できたら親が `/チンチロ振る` でスタート！"
+        )
+        embed.set_footer(text="※JPへの積み立てなし。場所代のみBurn。")
+        await interaction.response.send_message(embed=embed)
+
+        await asyncio.sleep(self.RECRUIT_TIMEOUT)
+        if ch_id in self.sessions and self.sessions[ch_id].phase == "recruiting":
+            del self.sessions[ch_id]
+            try:
+                await interaction.channel.send(
+                    f"⏰ 募集タイムアウト。\n{self.sesta('timeout')}"
+                )
+            except Exception:
+                pass
+
+    # ==========================================================
+    #  PVP: /チンチロ参加
+    # ==========================================================
+    @app_commands.command(name="チンチロ参加", description="開催中のチンチロに子として参加します。")
+    async def chinchiro_join(self, interaction: discord.Interaction):
+        ch_id = interaction.channel_id
+        user  = interaction.user
+
+        if ch_id not in self.sessions:
+            return await interaction.response.send_message(
+                "❌ 開催中のゲームがありません。", ephemeral=True
+            )
+        s = self.sessions[ch_id]
+        if s.phase != "recruiting":
+            return await interaction.response.send_message("❌ すでに振る段階です。", ephemeral=True)
+        if user.id == s.host.id:
+            return await interaction.response.send_message(
+                "セスタ「自分が親じゃん」", ephemeral=True
+            )
+        if any(p.id == user.id for p in s.players):
+            return await interaction.response.send_message(
+                "セスタ「もう入ってるじゃん」", ephemeral=True
+            )
+        if len(s.players) >= self.MAX_PLAYERS_PVP - 1:
+            return await interaction.response.send_message(
+                f"❌ 上限（{self.MAX_PLAYERS_PVP-1}人）に達しています。", ephemeral=True
+            )
+
+        venue_fee = int(s.bet * self.VENUE_RATE)
+        async with self.bot.get_db() as db:
+            await self.ensure_account(db, user.id)
+            if await self.get_balance(db, user.id) < s.bet + venue_fee:
+                return await interaction.response.send_message(self.sesta("broke"), ephemeral=True)
+
+        s.players.append(user)
+        embed = discord.Embed(title="✅ 参加しました！", color=0x00ff88)
+        embed.description = (
+            f"{user.mention} が参加！\n{self.sesta('join')}\n\n"
+            f"**親:** {s.host.mention}　**賭け金:** {s.bet:,} Stell\n"
+            f"**参加者（{len(s.players)}人）:** "
+            + ", ".join(p.mention for p in s.players)
+        )
+        await interaction.response.send_message(embed=embed)
+
+    # ==========================================================
+    #  PVP: /チンチロ振る
+    # ==========================================================
+    @app_commands.command(name="チンチロ振る", description="【親専用】サイコロを振って勝敗を決めます。")
+    async def chinchiro_roll(self, interaction: discord.Interaction):
+        ch_id = interaction.channel_id
+        user  = interaction.user
+
+        if ch_id not in self.sessions:
+            return await interaction.response.send_message("❌ 開催中のゲームがありません。", ephemeral=True)
+        s = self.sessions[ch_id]
+        if s.host.id != user.id:
+            return await interaction.response.send_message(
+                f"セスタ「親は {s.host.mention} じゃん」", ephemeral=True
+            )
+        if s.phase != "recruiting":
+            return await interaction.response.send_message("❌ すでに進行中です。", ephemeral=True)
+        if not s.players:
+            return await interaction.response.send_message(
+                "セスタ「子が誰もいない。一人でやっても意味ないじゃん」", ephemeral=True
+            )
+
+        s.phase     = "rolling"
+        bet         = s.bet
+        venue_fee   = int(bet * self.VENUE_RATE)
+        all_members = [s.host] + s.players
+
+        # 残高チェック
+        broke = []
+        async with self.bot.get_db() as db:
+            for m in all_members:
+                await self.ensure_account(db, m.id)
+                if await self.get_balance(db, m.id) < bet + venue_fee:
+                    broke.append(m)
+        if broke:
+            s.phase = "recruiting"
+            return await interaction.response.send_message(
+                f"❌ 残高不足: {', '.join(m.display_name for m in broke)}", ephemeral=True
+            )
+
+        # 全員から引く
+        async with self.bot.get_db() as db:
+            for m in all_members:
+                await db.execute(
+                    "UPDATE accounts SET balance = balance - ? WHERE user_id=?",
+                    (bet + venue_fee, m.id)
+                )
+            await db.commit()
+
+        total_fee_burn = venue_fee * len(all_members)
+
+        # アニメーション
+        await interaction.response.defer()
+        loading_embed = discord.Embed(
+            title="🎲 サイコロを振っています...",
+            description=f"{self.sesta('rolling')}\n\n⚀ ⚁ ⚂ ⚃ ⚄ ⚅",
+            color=0xffaa00
+        )
+        msg = await interaction.followup.send(embed=loading_embed)
+        await asyncio.sleep(0.8)
+        for _ in range(3):
+            fake = [random.randint(1,6) for _ in range(3)]
+            loading_embed.description = f"{self.sesta('rolling')}\n\n🎲 {dice_str(fake)} 🎲"
+            await msg.edit(embed=loading_embed)
+            await asyncio.sleep(0.5)
+
+        # 役確定
+        results     = {m.id: roll_until_role() for m in all_members}
+        h_rolls, h_role, h_score, h_mult = results[s.host.id]
+
+        win_members  = []
+        lose_members = []
+        draw_members = []
+        child_lines  = []
+
+        for m in s.players:
+            rolls, role_name, score, mult = results[m.id]
+            outcome = determine_outcome(h_mult, h_score, mult, score)
+            parts = []
+            for i, r in enumerate(rolls):
+                suffix = f"**{role_name}**" if i == len(rolls)-1 else "ハチ目"
+                parts.append(f"　{i+1}投目: {dice_str(r)}  {suffix}")
+            roll_disp = "\n".join(parts)
+            if outcome == "child_win":
+                child_lines.append(f"✅ {m.mention}\n{roll_disp}\n　→ **子の勝ち！**")
+                win_members.append((m, mult))
+            elif outcome == "host_win":
+                child_lines.append(f"❌ {m.mention}\n{roll_disp}\n　→ **親の勝ち**")
+                lose_members.append(m)
+            else:
+                child_lines.append(f"🟡 {m.mention}\n{roll_disp}\n　→ **引き分け（返却）**")
+                draw_members.append(m)
+
+        h_parts = []
+        for i, r in enumerate(h_rolls):
+            suffix = f"**{h_role}**" if i == len(h_rolls)-1 else "ハチ目"
+            h_parts.append(f"　{i+1}投目: {dice_str(r)}  {suffix}")
+
+        # 精算（PVPはJP積み立てなし）
+        host_profit = 0
+        month_tag   = datetime.datetime.now().strftime("%Y-%m")
+
+        async with self.bot.get_db() as db:
+            for m, c_mult in win_members:
+                win_amt = bet * pvp_payout_mult(c_mult)
+                await db.execute(
+                    "UPDATE accounts SET balance = balance + ? WHERE user_id=?",
+                    (bet + win_amt, m.id)
+                )
+                host_profit -= win_amt
+                await db.execute(
+                    "INSERT INTO transactions (sender_id,receiver_id,amount,type,description,month_tag)"
+                    " VALUES (0,?,?,'CHINCHIRO',?,?)",
+                    (m.id, win_amt, "チンチロPVP(子・勝ち)", month_tag)
+                )
+            for _ in lose_members:
+                host_profit += bet * pvp_payout_mult(h_mult)
+            for m in draw_members:
+                await db.execute(
+                    "UPDATE accounts SET balance = balance + ? WHERE user_id=?", (bet, m.id)
+                )
+            parent_return = bet + host_profit
+            if parent_return > 0:
+                await db.execute(
+                    "UPDATE accounts SET balance = balance + ? WHERE user_id=?",
+                    (parent_return, s.host.id)
+                )
+            await db.execute(
+                "INSERT INTO transactions (sender_id,receiver_id,amount,type,description,month_tag)"
+                " VALUES (0,?,?,'CHINCHIRO',?,?)",
+                (s.host.id, host_profit, f"チンチロPVP(親) {h_role}", month_tag)
+            )
+            await db.commit()
+
+        # コメント選択
+        if win_members and any(cm == 5 for _, cm in win_members):
+            key = "pinzoro_child"
+        elif h_mult == 5:   key = "pinzoro_host"
+        elif h_mult == -1:  key = "hifumi_host"
+        elif h_mult == 0:   key = "hachimai_host"
+        elif win_members:   key = "child_win"
+        elif not win_members and not draw_members: key = "host_sweep"
+        else:               key = "draw"
+
+        result_embed = discord.Embed(
+            title="🎲 チンチロ 結果発表！",
+            description=self.sesta(key),
+            color=0xff00ff
+        )
+        result_embed.add_field(
+            name=f"👑 親: {s.host.display_name}",
+            value="\n".join(h_parts), inline=False
+        )
+        for line in child_lines:
+            result_embed.add_field(name="\u200b", value=line, inline=False)
+
+        summary = []
+        if win_members:  summary.append("✅ 勝ち: " + ", ".join(m.display_name for m,_ in win_members))
+        if lose_members: summary.append("❌ 負け: " + ", ".join(m.display_name for m in lose_members))
+        if draw_members: summary.append("🟡 引き分け: " + ", ".join(m.display_name for m in draw_members))
+        profit_str = f"+{host_profit:,}" if host_profit >= 0 else f"{host_profit:,}"
+        summary.append(f"\n👑 親（{s.host.display_name}）収支: **{profit_str} Stell**")
+        summary.append(f"🏛️ 場所代Burn: **{total_fee_burn:,} Stell**")
+
+        result_embed.add_field(name="📊 収支", value="\n".join(summary), inline=False)
+        result_embed.set_footer(text=f"賭け金: {bet:,} S | 場所代: {venue_fee:,} S/人 | JPへの積み立て: なし")
+        await msg.edit(embed=result_embed)
+
+        now = datetime.datetime.now()
+        for m in all_members:
+            self.cooldowns[m.id] = now
+        del self.sessions[ch_id]
+
+    # ==========================================================
+    #  PVE: /チンチロレイド  ― 参加者募集
+    # ==========================================================
+    @app_commands.command(name="チンチロレイド", description="セスタに複数人で挑むレイド戦を開始します。")
+    @app_commands.describe(bet="賭け金を選んでください")
+    @app_commands.choices(bet=BET_CHOICES)
+    async def chinchiro_raid_start(self, interaction: discord.Interaction, bet: int):
+        ch_id = interaction.channel_id
+        user  = interaction.user
+
+        if ch_id in self.sessions:
+            return await interaction.response.send_message("❌ このチャンネルではPVPが進行中です。", ephemeral=True)
+        if ch_id in self.raid_sessions:
+            return await interaction.response.send_message("❌ すでにレイドが開催中です。", ephemeral=True)
+
+        rem = self.check_cooldown(user.id)
+        if rem:
+            return await interaction.response.send_message(self.sesta("cooldown", sec=rem), ephemeral=True)
+
+        venue_fee = int(bet * self.VENUE_RATE)
+        async with self.bot.get_db() as db:
+            await self.ensure_account(db, user.id)
+            if await self.get_balance(db, user.id) < bet + venue_fee:
+                return await interaction.response.send_message(self.sesta("broke"), ephemeral=True)
+
+        session = RaidSession(bet=bet, channel_id=ch_id)
+        session.players.append(user)
+        self.raid_sessions[ch_id] = session
+
+        embed = discord.Embed(title="⚔️ チンチロ レイド開催！", color=0xff4444)
+        embed.description = (
+            f"{self.sesta('raid_start')}\n\n"
+            f"**賭け金:** {bet:,} Stell　**場所代:** {venue_fee:,} Stell/人（Burn）\n\n"
+            f"`/チンチロレイド参加` でセスタに挑め！\n"
+            f"最大 **{self.MAX_PLAYERS_RAID}人** まで / **{self.RECRUIT_TIMEOUT}秒** で自動開始\n\n"
+            f"**参加者（1人）:** {user.mention}"
+        )
+        embed.add_field(
+            name="💰 報酬",
+            value=(
+                "セスタに勝てば役に応じた報酬！\n"
+                f"ピンゾロ: x2.0 / ゾロ目: x1.8 / シゴロ: x1.5\n"
+                f"目あり: x1.3 / その他勝ち: x1.2\n"
+                f"負け分の {int(self.RAID_JP_RATE*100)}% がJackpotへ積み立て"
+            ),
+            inline=False
+        )
+        embed.set_footer(text="参加者が揃ったら /チンチロレイド開始 で戦闘スタート！")
+        await interaction.response.send_message(embed=embed)
+
+        await asyncio.sleep(self.RECRUIT_TIMEOUT)
+        if ch_id in self.raid_sessions and self.raid_sessions[ch_id].phase == "recruiting":
+            # タイムアウトしたら自動で戦闘開始（1人以上いれば）
+            if self.raid_sessions[ch_id].players:
+                await self._execute_raid(interaction.channel, ch_id)
+            else:
+                del self.raid_sessions[ch_id]
+                try:
+                    await interaction.channel.send(self.sesta("timeout"))
+                except Exception:
+                    pass
+
+    # ==========================================================
+    #  PVE: /チンチロレイド参加
+    # ==========================================================
+    @app_commands.command(name="チンチロレイド参加", description="開催中のレイドに参加します。")
+    async def chinchiro_raid_join(self, interaction: discord.Interaction):
+        ch_id = interaction.channel_id
+        user  = interaction.user
+
+        if ch_id not in self.raid_sessions:
+            return await interaction.response.send_message(
+                "❌ 開催中のレイドがありません。`/チンチロレイド` で開始してください。", ephemeral=True
+            )
+        s = self.raid_sessions[ch_id]
+        if s.phase != "recruiting":
+            return await interaction.response.send_message("❌ すでに戦闘中です。", ephemeral=True)
+        if any(p.id == user.id for p in s.players):
+            return await interaction.response.send_message(
+                "セスタ「もう参加してるじゃん」", ephemeral=True
+            )
+        if len(s.players) >= self.MAX_PLAYERS_RAID:
+            return await interaction.response.send_message(
+                f"❌ 上限（{self.MAX_PLAYERS_RAID}人）に達しています。", ephemeral=True
+            )
+
+        venue_fee = int(s.bet * self.VENUE_RATE)
+        async with self.bot.get_db() as db:
+            await self.ensure_account(db, user.id)
+            if await self.get_balance(db, user.id) < s.bet + venue_fee:
+                return await interaction.response.send_message(self.sesta("broke"), ephemeral=True)
+
+        s.players.append(user)
+        embed = discord.Embed(title="✅ レイド参加！", color=0xff4444)
+        embed.description = (
+            f"{user.mention} が参加！\n{self.sesta('raid_join')}\n\n"
+            f"**賭け金:** {s.bet:,} Stell\n"
+            f"**参加者（{len(s.players)}人）:** "
+            + ", ".join(p.mention for p in s.players)
+        )
+        await interaction.response.send_message(embed=embed)
+
+    # ==========================================================
+    #  PVE: /チンチロレイド開始  ― 戦闘実行
+    # ==========================================================
+    @app_commands.command(name="チンチロレイド開始", description="参加者が揃ったらレイドを開始します。")
+    async def chinchiro_raid_execute(self, interaction: discord.Interaction):
+        ch_id = interaction.channel_id
+
+        if ch_id not in self.raid_sessions:
+            return await interaction.response.send_message("❌ 開催中のレイドがありません。", ephemeral=True)
+        s = self.raid_sessions[ch_id]
+        if interaction.user.id not in [p.id for p in s.players]:
+            return await interaction.response.send_message(
+                "セスタ「参加してないじゃん」", ephemeral=True
+            )
+        if s.phase != "recruiting":
+            return await interaction.response.send_message("❌ すでに進行中です。", ephemeral=True)
+
+        await interaction.response.defer()
+        await self._execute_raid(interaction.channel, ch_id, followup=interaction)
+
+    # ==========================================================
+    #  レイド戦闘コア
+    # ==========================================================
+    async def _execute_raid(self, channel, ch_id: int, followup=None):
+        if ch_id not in self.raid_sessions:
+            return
+        s = self.raid_sessions[ch_id]
+        s.phase   = "rolling"
+        bet       = s.bet
+        venue_fee = int(bet * self.VENUE_RATE)
+        players   = s.players
+
+        # 残高チェック
+        broke = []
+        async with self.bot.get_db() as db:
+            for m in players:
+                await self.ensure_account(db, m.id)
+                if await self.get_balance(db, m.id) < bet + venue_fee:
+                    broke.append(m)
+        if broke:
+            # 残高不足者を除外
+            players = [m for m in players if m not in broke]
+            if not players:
+                del self.raid_sessions[ch_id]
+                await channel.send(
+                    "❌ 参加者全員の残高が不足していたためレイドを中止しました。\n"
+                    + self.sesta("broke")
+                )
+                return
+
+        # 全員から引く
+        async with self.bot.get_db() as db:
+            for m in players:
+                await db.execute(
+                    "UPDATE accounts SET balance = balance - ? WHERE user_id=?",
+                    (bet + venue_fee, m.id)
+                )
+            await db.commit()
+
+        total_fee_burn = venue_fee * len(players)
+
+        # アニメーション
+        loading_embed = discord.Embed(
+            title="⚔️ レイド戦 開始！",
+            description=f"{self.sesta('raid_rolling')}\n\n🎲 セスタがサイコロを振っています... 🎲",
+            color=0xff4444
+        )
+        if followup:
+            msg = await followup.followup.send(embed=loading_embed)
+        else:
+            msg = await channel.send(embed=loading_embed)
+
+        await asyncio.sleep(0.8)
+        for _ in range(3):
+            fake = [random.randint(1,6) for _ in range(3)]
+            loading_embed.description = (
+                f"{self.sesta('raid_rolling')}\n\n"
+                f"🎲 セスタ: {dice_str(fake)} 🎲"
+            )
+            await msg.edit(embed=loading_embed)
+            await asyncio.sleep(0.5)
+
+        # セスタの役を決定
+        sesta_rolls, sesta_role, sesta_score, sesta_mult = roll_until_role()
+
+        # 参加者全員の役を決定
+        player_results = {m.id: roll_until_role() for m in players}
+
+        # 勝敗判定 & 精算
+        win_players  = []   # (member, player_mult, reward)
+        lose_players = []
+        draw_players = []
+        player_lines = []
+
+        total_lost  = 0
+        month_tag   = datetime.datetime.now().strftime("%Y-%m")
+        jp_total    = 0
+
+        async with self.bot.get_db() as db:
+            for m in players:
+                rolls, role_name, score, mult = player_results[m.id]
+                outcome = determine_outcome(sesta_mult, sesta_score, mult, score)
+
+                parts = []
+                for i, r in enumerate(rolls):
+                    suffix = f"**{role_name}**" if i == len(rolls)-1 else "ハチ目"
+                    parts.append(f"　{i+1}投目: {dice_str(r)}  {suffix}")
+                roll_disp = "\n".join(parts)
+
+                if outcome == "child_win":
+                    reward_mult = raid_reward_mult(mult)
+                    reward      = int(bet * reward_mult)
+                    await db.execute(
+                        "UPDATE accounts SET balance = balance + ? WHERE user_id=?",
+                        (reward, m.id)
+                    )
+                    profit = reward - bet
+                    player_lines.append(
+                        f"✅ {m.mention}\n{roll_disp}\n"
+                        f"　→ **勝ち！** {reward:,} S 獲得（+{profit:,} S）"
+                    )
+                    win_players.append((m, mult, reward))
+                    await db.execute(
+                        "INSERT INTO transactions (sender_id,receiver_id,amount,type,description,month_tag)"
+                        " VALUES (0,?,?,'CHINCHIRO_RAID',?,?)",
+                        (m.id, profit, f"レイド勝ち {role_name}", month_tag)
+                    )
+                elif outcome == "host_win":
+                    # 負け分の5%JP、95%Burn
+                    jp_seed = int(bet * self.RAID_JP_RATE)
+                    jp_total   += jp_seed
+                    total_lost += bet
+                    player_lines.append(
+                        f"❌ {m.mention}\n{roll_disp}\n"
+                        f"　→ **負け**（{jp_seed:,} S → JP積み立て）"
+                    )
+                    lose_players.append(m)
+                    await db.execute(
+                        "INSERT INTO transactions (sender_id,receiver_id,amount,type,description,month_tag)"
+                        " VALUES (0,?,?,'CHINCHIRO_RAID',?,?)",
+                        (m.id, -bet, f"レイド負け", month_tag)
+                    )
+                else:
+                    # 引き分け → 賭け金返却
+                    await db.execute(
+                        "UPDATE accounts SET balance = balance + ? WHERE user_id=?", (bet, m.id)
+                    )
+                    player_lines.append(
+                        f"🟡 {m.mention}\n{roll_disp}\n　→ **引き分け**（賭け金返却）"
+                    )
+                    draw_players.append(m)
+
+            await self.add_to_jackpot(db, jp_total)
+            await db.commit()
+
+        # セスタの表示
+        sesta_parts = []
+        for i, r in enumerate(sesta_rolls):
+            suffix = f"**{sesta_role}**" if i == len(sesta_rolls)-1 else "ハチ目"
+            sesta_parts.append(f"　{i+1}投目: {dice_str(r)}  {suffix}")
+
+        # コメント選択
+        if sesta_mult == 5:   sesta_key = "raid_pinzoro_sesta"
+        elif sesta_mult == -1: sesta_key = "raid_hifumi_sesta"
+        elif not win_players and not draw_players: sesta_key = "raid_all_lose"
+        elif not lose_players and not draw_players: sesta_key = "raid_all_win"
+        elif win_players:      sesta_key = "raid_partial"
+        else:                  sesta_key = "raid_sesta_strong"
+
+        # 結果Embed
+        result_embed = discord.Embed(
+            title="⚔️ レイド戦 結果発表！",
+            description=self.sesta(sesta_key),
+            color=0xff4444
+        )
+        result_embed.add_field(
+            name="👾 セスタの結果",
+            value="\n".join(sesta_parts),
+            inline=False
+        )
+        for line in player_lines:
+            result_embed.add_field(name="\u200b", value=line, inline=False)
+
+        summary = []
+        if win_players:  summary.append(f"✅ 勝利: {len(win_players)}人")
+        if lose_players: summary.append(f"❌ 敗北: {len(lose_players)}人")
+        if draw_players: summary.append(f"🟡 引き分け: {len(draw_players)}人")
+        summary.append(f"\n🏛️ 場所代Burn: **{total_fee_burn:,} Stell**")
+        if jp_total > 0:
+            summary.append(f"💎 Jackpot積み立て: **{jp_total:,} Stell**")
+
+        result_embed.add_field(name="📊 集計", value="\n".join(summary), inline=False)
+        result_embed.set_footer(
+            text=f"賭け金: {bet:,} S | 場所代: {venue_fee:,} S/人 | 負け分の{int(self.RAID_JP_RATE*100)}%→JP"
+        )
+        await msg.edit(embed=result_embed)
+
+        now = datetime.datetime.now()
+        for m in players:
+            self.cooldowns[m.id] = now
+        del self.raid_sessions[ch_id]
+
+    # ==========================================================
+    #  /チンチロ解散
+    # ==========================================================
+    @app_commands.command(name="チンチロ解散", description="開催中のゲームを解散します（主催者または管理者のみ）。")
+    async def chinchiro_cancel(self, interaction: discord.Interaction):
+        ch_id = interaction.channel_id
+        user  = interaction.user
+
+        # PVP
+        if ch_id in self.sessions:
+            s = self.sessions[ch_id]
+            if s.host.id != user.id and not user.guild_permissions.administrator:
+                return await interaction.response.send_message(
+                    "セスタ「解散できるのは親だけじゃん」", ephemeral=True
+                )
+            del self.sessions[ch_id]
+            return await interaction.response.send_message(
+                f"🚫 ゲームを解散しました。\nセスタ「また来てよ。……待ってるから」"
+            )
+
+        # レイド
+        if ch_id in self.raid_sessions:
+            s = self.raid_sessions[ch_id]
+            is_host  = s.players and s.players[0].id == user.id
+            is_admin = user.guild_permissions.administrator
+            if not is_host and not is_admin:
+                return await interaction.response.send_message(
+                    "セスタ「主催者か管理者じゃないと解散できないじゃん」", ephemeral=True
+                )
+            del self.raid_sessions[ch_id]
+            return await interaction.response.send_message(
+                f"🚫 レイドを解散しました。\nセスタ「……次は逃げないでよ」"
+            )
+
+        await interaction.response.send_message("❌ 開催中のゲームはありません。", ephemeral=True)
+
+    # ==========================================================
+    #  /チンチロ役一覧
+    # ==========================================================
+    @app_commands.command(name="チンチロ役一覧", description="役と倍率の一覧を確認します。")
+    async def chinchiro_help(self, interaction: discord.Interaction):
+        embed = discord.Embed(
+            title="📖 チンチロ 役一覧",
+            description="セスタ「覚えてから来なよ。……まぁ、教えてあげるけど」",
+            color=0xff00ff
+        )
+        embed.add_field(name="🌟 ピンゾロ  (1-1-1)", value="最強。PVP: x5倍 / レイド: x2.0倍返し",  inline=False)
+        embed.add_field(name="✨ ゾロ目   (n-n-n)", value="PVP: x3倍 / レイド: x1.8倍返し",          inline=False)
+        embed.add_field(name="🔥 シゴロ   (4-5-6)", value="PVP: x2倍 / レイド: x1.5倍返し",          inline=False)
+        embed.add_field(name="🎯 目あり   (n-n-x)", value="目の数字で勝負。レイド勝ち: x1.3倍返し",   inline=False)
+        embed.add_field(name="💀 ヒフミ   (1-2-3)", value="即負け役。",                               inline=False)
+        embed.add_field(name="😶 ハチ目   (その他)", value="役なし。3回全部→引き分け（賭け金返却）",   inline=False)
+        embed.add_field(
+            name="💰 お金の流れ",
+            value=(
+                f"**PVP:** 場所代5%Burn / JPなし\n"
+                f"**レイド:** 場所代5%Burn + 負け分の5%→JP"
+            ),
+            inline=False
+        )
+        embed.set_footer(text=f"CD: {self.COOLDOWN_SECONDS}秒")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # --- 色定義 ---
 def ansi(text, color_code): return f"\x1b[{color_code}m{text}\x1b[0m"
