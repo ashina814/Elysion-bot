@@ -1861,7 +1861,7 @@ class Chinchiro(commands.Cog):
             for m in all_members:
                 await cesta_cog.sub_balance(db, m.id, bet + venue_fee)
         newly = await cesta.record_spend(db, m.id, bet + venue_fee)
-            await db.commit()
+                await db.commit()
 
         total_burn = venue_fee * len(all_members)
         month_tag  = datetime.datetime.now().strftime("%Y-%m")
