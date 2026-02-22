@@ -2296,7 +2296,7 @@ class Slot(commands.Cog):
             "MISS":    "💨"
         }
         
-                self.MODES = {
+        self.MODES = {
             "1": { # 期待値: 約88.5% (しっかり回収)
                 "probs": [
                     ("DIAMOND", 5, 100), ("SEVEN", 40, 20), ("WILD", 70, 10),
