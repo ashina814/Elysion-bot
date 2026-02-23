@@ -1870,7 +1870,7 @@ class ChinchiroRecruitView(discord.ui.View):
 
 class Chinchiro(commands.Cog):
 
-    COOLDOWN_SECONDS = 30
+    COOLDOWN_SECONDS = 10
     VENUE_RATE       = 0.03
     SHONBEN_RATE     = 0.03
 
@@ -2256,7 +2256,7 @@ class Chinchiro(commands.Cog):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ── /チンチロソロ ─────────────────────────────────────
-    @app_commands.command(name="チンチロソロ", description="セスタと1対1でチンチロ勝負！（還元率95%）")
+    @app_commands.command(name="チンチロソロ", description="セスタと1対1でチンチロ勝負！")
     @app_commands.describe(bet="賭け金（セスタ）")
     @app_commands.choices(bet=[
         app_commands.Choice(name="10 セスタ",  value=10),
