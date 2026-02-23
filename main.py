@@ -2735,39 +2735,42 @@ class Blackjack(commands.Cog):
         player_hand = [deck.pop(), deck.pop()]
         sesta_hand  = [deck.pop(), deck.pop()]
 
-p_val = bj_hand_value(player_hand)
-s_val = bj_hand_value(sesta_hand)
+        p_val = bj_hand_value(player_hand)
+        s_val = bj_hand_value(sesta_hand)
 
-if p_val == 21:
-    if s_val == 21:
-        # 両者BJ → 引き分け、賭け金をそのまま返す
-        payout = bet
-        async with self.bot.get_db() as db:
-            await cesta_cog.add_balance(db, user.id, payout)
-            await db.commit()
-        result = f"🟡 **引き分け（両者ブラックジャック）！**\nセスタ「{c_line_bj('draw')}」\n\n賭け金: **{bet:,} セスタ** | 結果: **±0 セスタ**"
-        embed = discord.Embed(title="🃏 ブラックジャック vsセスタ", description=(
-            f"**あなたの手札**: {bj_card_str(player_hand)}  `{p_val}`\n"
-            f"**セスタの手札**: {bj_card_str(sesta_hand)}  `{s_val}`\n\n{result}"
-        ), color=discord.Color.yellow())
-        return await interaction.response.send_message(embed=embed, ephemeral=True)
+        if p_val == 21:
+            if s_val == 21:
+                # 両者BJ → 引き分け、賭け金をそのまま返す
+                payout = bet
+                async with self.bot.get_db() as db:
+                    await cesta_cog.add_balance(db, user.id, payout)
+                    await db.commit()
+                result = f"🟡 **引き分け（両者ブラックジャック）！**\nセスタ「{c_line_bj('draw')}」\n\n賭け金: **{bet:,} セスタ** | 結果: **±0 セスタ**"
+                embed = discord.Embed(title="🃏 ブラックジャック vsセスタ", description=(
+                    f"**あなたの手札**: {bj_card_str(player_hand)}  `{p_val}`\n"
+                    f"**セスタの手札**: {bj_card_str(sesta_hand)}  `{s_val}`\n\n{result}"
+                ), color=discord.Color.yellow())
+                return await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # プレイヤーのみBJ → 2.5倍
-    payout = int(bet * 2.5)
-    async with self.bot.get_db() as db:
-        await cesta_cog.add_balance(db, user.id, payout)
-        await db.commit()
-    result = f"🌟 **ブラックジャック！**\nセスタ「{c_line_bj('blackjack')}」\n\n賭け金: **{bet:,} セスタ** | 結果: **+{payout - bet:,} セスタ**"
-    embed = discord.Embed(title="🃏 ブラックジャック vsセスタ", description=(
-        f"**あなたの手札**: {bj_card_str(player_hand)}  `{p_val}`\n"
-        f"**セスタの手札**: {bj_card_str(sesta_hand)}  `{s_val}`\n\n{result}"
-    ), color=discord.Color.gold())
-    return await interaction.response.send_message(embed=embed, ephemeral=True)
+            # プレイヤーのみBJ → 2.5倍
+            payout = int(bet * 2.5)
+            async with self.bot.get_db() as db:
+                await cesta_cog.add_balance(db, user.id, payout)
+                await db.commit()
+            result = f"🌟 **ブラックジャック！**\nセスタ「{c_line_bj('blackjack')}」\n\n賭け金: **{bet:,} セスタ** | 結果: **+{payout - bet:,} セスタ**"
+            embed = discord.Embed(title="🃏 ブラックジャック vsセスタ", description=(
+                f"**あなたの手札**: {bj_card_str(player_hand)}  `{p_val}`\n"
+                f"**セスタの手札**: {bj_card_str(sesta_hand)}  `{s_val}`\n\n{result}"
+            ), color=discord.Color.gold())
+            return await interaction.response.send_message(embed=embed, ephemeral=True)
 
-view  = BlackjackView(self, interaction, bet, player_hand, sesta_hand, deck, cesta_cog)
-embed = view._embed()
-embed.set_footer(text=f"セスタ「{c_line_bj('deal')}」")
-await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        view  = BlackjackView(self, interaction, bet, player_hand, sesta_hand, deck, cesta_cog)
+        embed = view._embed()
+        embed.set_footer(text=f"セスタ「{c_line_bj('deal')}」")
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    
+
+
         
 # --- 色定義 ---
 def ansi(text, color_code): return f"\x1b[{color_code}m{text}\x1b[0m"
