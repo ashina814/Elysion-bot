@@ -2597,7 +2597,8 @@ class BlackjackView(discord.ui.View):
             color=color
         )
 
-    async def _finish(self, interaction):
+async def _finish(self, interaction):
+        if self.done: return
         self.done = True
         self.stop()
 
@@ -2607,7 +2608,6 @@ class BlackjackView(discord.ui.View):
         s_val = bj_hand_value(self.sesta)
         p_val = bj_hand_value(self.player)
 
-        payout = 0
         if s_val > 21:
             result = f"💥 セスタバースト！\nセスタ「{c_line_bj('sesta_bust')}」"
             payout = self.bet * 2
@@ -2625,12 +2625,13 @@ class BlackjackView(discord.ui.View):
             payout = self.bet
             color  = discord.Color.yellow()
 
-        result += f"\n\n賭け金: **{self.bet:,} セスタ** | 結果: **{'+' if payout - self.bet >= 0 else ''}{payout - self.bet:,} セスタ**"
+        net = payout - self.bet
+        result += f"\n\n賭け金: **{self.bet:,} セスタ** | 結果: **{'+' if net >= 0 else ''}{net:,} セスタ**"
 
-        if payout > 0:
-            async with self.cog.bot.get_db() as db:
+        async with self.cog.bot.get_db() as db:
+            if payout > 0:
                 await self.cesta_cog.add_balance(db, interaction.user.id, payout)
-                await db.commit()
+            await db.commit()
 
         embed = self._embed(hide_sesta=False, result_text=result, color=color)
         await interaction.response.edit_message(embed=embed, view=None)
