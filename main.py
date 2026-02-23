@@ -1742,7 +1742,7 @@ class ChinchiroRecruitView(discord.ui.View):
         embed     = discord.Embed(title="🎲 チンチロ 参加者募集中！", color=0xff00ff)
         embed.description = (
             f"**親:** {s.host.mention}\n"
-            f"**賭け金:** {s.bet:,} セスタ　**場所代:** {venue_fee:,} セスタ/人（Burn）\n\n"
+            f"**賭け金:** {s.bet:,} セスタ　**場所代:** {venue_fee:,} Stell/人（Burn）\n\n"
             f"**参加者（{len(s.players)}人）:** "
             + (", ".join(p.mention for p in s.players) if s.players else "なし")
             + f"\n\n親が **▶️開始する** を押したらスタート！"
