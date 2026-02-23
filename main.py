@@ -3160,14 +3160,24 @@ class CestaSystem(commands.Cog):
 
     @app_commands.command(name="セスタ残高", description="セスタコインの残高を確認します")
     async def cesta_balance(self, interaction: discord.Interaction):
-        bal = await self.get_balance(interaction.user.id)
         async with self.bot.get_db() as db:
+            async with db.execute(
+                "SELECT balance FROM cesta_wallets WHERE user_id = ?", (interaction.user.id,)
+            ) as c:
+                row = await c.fetchone()
+            bal = row["balance"] if row else 0
+
             async with db.execute(
                 "SELECT balance FROM accounts WHERE user_id = ?", (interaction.user.id,)
             ) as c:
                 row = await c.fetchone()
-        stell_bal = row["balance"] if row else 0
-        rate = await _cfg(self.bot, "cesta_rate")
+            stell_bal = row["balance"] if row else 0
+
+            async with db.execute(
+                "SELECT value FROM server_config WHERE key = 'cesta_rate'"
+            ) as c:
+                row = await c.fetchone()
+            rate = int(row["value"]) if row else 10000
 
         embed = discord.Embed(title="🎰 セスタコイン残高", color=0x9b59b6)
         embed.add_field(name="💜 セスタ", value=f"**{bal:,} セスタ**", inline=True)
