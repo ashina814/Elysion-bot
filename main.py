@@ -2597,7 +2597,7 @@ class BlackjackView(discord.ui.View):
             color=color
         )
 
-async def _finish(self, interaction):
+    async def _finish(self, interaction):
         if self.done: return
         self.done = True
         self.stop()
@@ -2633,7 +2633,7 @@ async def _finish(self, interaction):
                 await self.cesta_cog.add_balance(db, interaction.user.id, payout)
             await db.commit()
 
-        Embed = self._embed(hide_sesta=False, result_text=result, color=color)
+        embed = self._embed(hide_sesta=False, result_text=result, color=color)
         await interaction.response.edit_message(embed=embed, view=None)
 
     @discord.ui.button(label="ヒット 🃏", style=discord.ButtonStyle.primary)
