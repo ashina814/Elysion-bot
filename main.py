@@ -1668,7 +1668,7 @@ class ChinchiroSession:
         self.phase      = "recruiting"
         self.started_at = datetime.datetime.now()
 
-# ================================================================
+#================================================================
 #  PVP UI: 募集パネル
 # ================================================================
 
@@ -2051,6 +2051,56 @@ class Chinchiro(commands.Cog):
             self.cooldowns[m.id] = now
         if s.channel_id in self.sessions:
             del self.sessions[s.channel_id]
+
+    # ── サイコロアニメーション ────────────────────────────
+    async def _animated_roll(
+        self, msg, embed, member, is_host: bool,
+        host_role: str = ""
+    ):
+        label = f"👑 親: {member.display_name}" if is_host else f"🎲 {member.display_name}"
+        rolls, role_name, score, mult = roll_until_role()
+        all_parts = []
+
+        for i, dice in enumerate(rolls):
+            is_last = (i == len(rolls) - 1)
+            _, _, tmp_mult = judge_roll(dice)
+
+            # セリフ選択
+            if i == 0:
+                _, _, m0 = judge_roll(dice)
+                if m0 == 0:    selife = c_line("roll1_hachi")
+                elif m0 == -1: selife = c_line("roll1_hifumi")
+                else:          selife = c_line("roll1_good")
+            elif i == 1:
+                _, _, m1 = judge_roll(dice)
+                # 前の目と合わせてリーチ判定
+                prev = rolls[0]
+                if m1 == 0:
+                    selife = c_line("roll2_hachi")
+                elif any(dice.count(v) >= 2 for v in dice):
+                    selife = c_line("roll2_reach")
+                else:
+                    selife = c_line("roll2_good")
+            else:
+                if mult == 5:      selife = c_line("roll3_pinzoro")
+                elif mult == 2:    selife = c_line("roll3_shigoro")
+                elif mult == 3:    selife = c_line("roll3_zorume")
+                elif mult is None: selife = c_line("roll3_miari")
+                elif mult == -1:   selife = c_line("roll3_hifumi")
+                else:              selife = c_line("roll3_shonben")
+
+            suffix = f"**{role_name}**" if is_last else "ハチ目"
+            all_parts.append(f"　{i+1}投目: {dice_str(dice)} {suffix}")
+
+            embed.description = (
+                f"{label}\n\n"
+                + "\n".join(all_parts)
+                + f"\n\nセスタ「{selife}」"
+            )
+            await msg.edit(embed=embed)
+            await asyncio.sleep(1.0)
+
+        return rolls, role_name, score, mult
 
     # ── /チンチロ解散 ──────────────────────────────────────
     @app_commands.command(name="チンチロ解散", description="開催中のゲームを解散します")
@@ -4077,7 +4127,7 @@ class StockControlView(discord.ui.View):
         else:
             await interaction.response.send_message(msg, ephemeral=True)
 
-# ── /セスタショップ_商品登録 ───────────────────────────
+#── /セスタショップ_商品登録 ───────────────────────────
     @app_commands.command(name="セスタショップ_商品登録", description="【管理者】セスタショップに商品を登録します")
     @app_commands.describe(
         item_id="商品ID（英数字推奨、例: joker_role）",
@@ -5824,17 +5874,17 @@ class CestaBankBot(commands.Bot):
         await self.add_cog(ServerStats(self))
         await self.add_cog(ShopSystem(self))
         await self.add_cog(HumanStockMarket(self))
-        await self.add_cog(CestaShop(self))
 
         await self.add_cog(VoiceSystem(self))
         await self.add_cog(PrivateVCManager(self))
         await self.add_cog(VoiceHistory(self))
         await self.add_cog(InterviewSystem(self))
-        
-        await self.add_cog(Chinchiro(self))
+
         await self.add_cog(Jackpot(self))
         await self.add_cog(Omikuji(self))
         await self.add_cog(CestaSystem(self))
+        await self.add_cog(CestaShop(self))
+        await self.add_cog(Chinchiro(self))
         await self.add_cog(SlotMachine(self))
         
         if not self.backup_db_task.is_running():
