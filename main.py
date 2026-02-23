@@ -2637,7 +2637,7 @@ async def _finish(self, interaction):
         await interaction.response.edit_message(embed=embed, view=None)
 
         @discord.ui.button(label="ヒット 🃏", style=discord.ButtonStyle.primary)
-    async def hit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async def hit(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.interaction.user.id:
             return await interaction.response.send_message("あなたのゲームじゃないよ！", ephemeral=True)
         if self.done: return
