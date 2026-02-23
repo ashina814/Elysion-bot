@@ -2430,6 +2430,7 @@ class Chinchiro(commands.Cog):
             if outcome == "child_win":
                 reward_mult = solo_reward_mult(p_mult)
                 payout      = int(bet * reward_mult)
+                logger.info(f"[SOLO DEBUG] p_mult={p_mult}, reward_mult={reward_mult}, bet={bet}, payout={payout}")
                 await cesta_cog.add_balance(db, user.id, payout)
             elif outcome == "draw":
                 payout = bet
