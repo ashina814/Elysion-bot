@@ -3242,7 +3242,7 @@ class CestaSystem(commands.Cog):
         embed.set_footer(text=f"本日の購入合計: {today_bought + amount}/{buy_cap} セスタ")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@app_commands.command(name="セスタ設定", description="【管理者】セスタ・ブラックジャック・チンチロの各種設定を変更します")
+    @app_commands.command(name="セスタ設定", description="【管理者】セスタ・ブラックジャック・チンチロの各種設定を変更します")
     @app_commands.describe(
         cesta_rate="Stell→セスタ変換レート (N Stell = 1 セスタ)",
         cesta_daily="デイリー配布量（セスタ）",
