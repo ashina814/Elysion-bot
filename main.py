@@ -1590,18 +1590,16 @@ def pvp_payout_mult(mult):
 
 def solo_reward_mult(mult):
     """
-    PVE一人用: 還元率95%に調整した返却倍率
-    ピンゾロ→x1.9 / ゾロ目→x1.7 / シゴロ→x1.4
-    目あり→x1.2 / ヒフミで勝ち→x1.1
-    場所代2%と合わせて期待値≒95%
+    PVE一人用: 還元率95%に調整した返却倍率（場所代なし）
+    シミュレーション検証済み: 期待値≒95%
     """
-    if mult == 5:    return 3.3
-    if mult == 3:    return 2.7
-    if mult == 2:    return 2.2
-    if mult is None: return 1.7
-    if mult == -1:   return 1.4
+    if mult == 5:    return 3.4
+    if mult == 3:    return 2.75
+    if mult == 2:    return 2.25
+    if mult is None: return 1.75
+    if mult == -1:   return 1.45
     return 1.0
-
+    
 # ================================================================
 #  チンチロ セリフ
 # ================================================================
@@ -2261,8 +2259,6 @@ class Chinchiro(commands.Cog):
     @app_commands.command(name="チンチロソロ", description="セスタと1対1でチンチロ勝負！（還元率95%）")
     @app_commands.describe(bet="賭け金（セスタ）")
     @app_commands.choices(bet=[
-        app_commands.Choice(name="1 セスタ",   value=1),
-        app_commands.Choice(name="5 セスタ",   value=5),
         app_commands.Choice(name="10 セスタ",  value=10),
         app_commands.Choice(name="50 セスタ",  value=50),
         app_commands.Choice(name="100 セスタ", value=100),
@@ -5592,7 +5588,7 @@ class AdminTools(commands.Cog):
         game="解除するゲーム"
     )
     @app_commands.choices(game=[
-        app_commands.Choice(name="チンチロ", value="chinchiro"),
+        app_commands.Choice(name="チンチロ", value="chinchiro_solo"),
         app_commands.Choice(name="スロット", value="slot"),
         app_commands.Choice(name="両方", value="all"),
     ])
