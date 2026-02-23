@@ -2711,6 +2711,7 @@ class Blackjack(commands.Cog):
 
         async with self.bot.get_db() as db:
             await cesta_cog.sub_balance(db, user.id, bet)
+            await cesta_cog.record_spend(db, user.id, bet)
             await db.commit()
 
         deck        = bj_new_deck()
