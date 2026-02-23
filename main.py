@@ -2633,11 +2633,11 @@ async def _finish(self, interaction):
                 await self.cesta_cog.add_balance(db, interaction.user.id, payout)
             await db.commit()
 
-        embed = self._embed(hide_sesta=False, result_text=result, color=color)
+        Embed = self._embed(hide_sesta=False, result_text=result, color=color)
         await interaction.response.edit_message(embed=embed, view=None)
 
-        @discord.ui.button(label="ヒット 🃏", style=discord.ButtonStyle.primary)
-        async def hit(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="ヒット 🃏", style=discord.ButtonStyle.primary)
+    async def hit(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.interaction.user.id:
             return await interaction.response.send_message("あなたのゲームじゃないよ！", ephemeral=True)
         if self.done: return
@@ -2665,6 +2665,7 @@ async def _finish(self, interaction):
 
     async def on_timeout(self):
         self.stop()
+
 
 
 class Blackjack(commands.Cog):
