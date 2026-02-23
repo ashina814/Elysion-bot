@@ -1,8 +1,4 @@
 import discord
-import matplotlib
-matplotlib.use('Agg') # サーバー上でグラフを描くための設定
-import matplotlib.pyplot as plt
-import io
 from discord.ext import commands, tasks
 from discord import app_commands, ui
 import aiosqlite
@@ -16,23 +12,9 @@ import math
 import contextlib
 import os
 from typing import Optional, List, Dict
-from PIL import Image, ImageDraw, ImageFont
 from dotenv import load_dotenv
 from logging.handlers import RotatingFileHandler
 
-# numpyは必須ではないが、あれば使う設定
-try:
-    import numpy as np
-except ImportError:
-    np = None
-
-# keep_aliveの安全なインポート
-try:
-    import keep_alive
-except ImportError:
-    keep_alive = None
-
-GEKIATSU = "<:b_069:1438962326463054008>" # 必要であればこの絵文字IDも変更してください
 
 # --- 環境変数とロギング ---
 load_dotenv() 
@@ -839,25 +821,53 @@ class Economy(commands.Cog):
 
     @app_commands.command(name="今日の残り回数", description="今日のギャンブル残り回数を確認します")
     async def check_remaining(self, interaction: discord.Interaction):
-        # ↓ ここから下の行は、すべて半角スペース4つ分（またはTab1回分）右にズラす
-        _, remaining_chinchiro = await check_daily_limit(self.bot, interaction.user.id, "chinchiro")
-        _, remaining_slot = await check_daily_limit(self.bot, interaction.user.id, "slot")
+        user_id = interaction.user.id
+        today   = datetime.datetime.now().strftime("%Y-%m-%d")
+
+        slot_limit      = await _cfg(self.bot, "slot_daily_limit")
+        chinchiro_limit = await _cfg(self.bot, "chinchiro_daily_limit")
+
+        async with self.bot.get_db() as db:
+            async with db.execute(
+                "SELECT count FROM daily_play_counts WHERE user_id=? AND game='slot' AND date=?",
+                (user_id, today)
+            ) as c:
+                row = await c.fetchone()
+            slot_count = row["count"] if row else 0
+
+            async with db.execute(
+                "SELECT 1 FROM daily_play_exemptions WHERE user_id=? AND game='slot' AND date=?",
+                (user_id, today)
+            ) as c:
+                slot_exempt = bool(await c.fetchone())
+
+            async with db.execute(
+                "SELECT count FROM daily_play_counts WHERE user_id=? AND game='chinchiro' AND date=?",
+                (user_id, today)
+            ) as c:
+                row = await c.fetchone()
+            chinchiro_count = row["count"] if row else 0
+
+            async with db.execute(
+                "SELECT 1 FROM daily_play_exemptions WHERE user_id=? AND game='chinchiro' AND date=?",
+                (user_id, today)
+            ) as c:
+                chinchiro_exempt = bool(await c.fetchone())
 
         embed = discord.Embed(title="🎲 本日のギャンブル残り回数", color=0x2b2d31)
         embed.add_field(
             name="🎲 チンチロ",
-            value=f"残り **{min(remaining_chinchiro, 10)} / 10** 回" if remaining_chinchiro < 99999 else "✨ 制限解除中",
+            value="✨ 制限解除中" if chinchiro_exempt else f"残り **{max(chinchiro_limit - chinchiro_count, 0)} / {chinchiro_limit}** 回",
             inline=True
         )
         embed.add_field(
             name="🎰 スロット",
-            value=f"残り **{min(remaining_slot, 10)} / 10** 回" if remaining_slot < 99999 else "✨ 制限解除中",
+            value="✨ 制限解除中" if slot_exempt else f"残り **{max(slot_limit - slot_count, 0)} / {slot_limit}** 回",
             inline=True
         )
         embed.set_footer(text="制限は毎日0時にリセットされます")
         await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
+        
     # === 追加機能1: 所持金ランキング ===
     @app_commands.command(name="ランキング", description="サーバー内の大富豪トップ10を表示します")
     async def ranking(self, interaction: discord.Interaction):
@@ -2164,6 +2174,22 @@ class Chinchiro(commands.Cog):
                 f"セスタ「{c_line('cooldown', sec=rem)}」", ephemeral=True
             )
 
+        # ── 日次プレイ上限チェック ──
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        daily_limit = await _cfg(self.bot, "chinchiro_daily_limit")
+        async with self.bot.get_db() as db:
+            async with db.execute(
+                "SELECT count FROM daily_play_counts WHERE user_id=? AND game='chinchiro' AND date=?",
+                (user.id, today)
+            ) as c:
+                row = await c.fetchone()
+            play_count = row["count"] if row else 0
+        if play_count >= daily_limit:
+            return await interaction.response.send_message(
+                f"🚫 今日のチンチロ上限（**{daily_limit}回**）に達したよ！また明日ね〜♪",
+                ephemeral=True
+            )
+
         venue_fee = int(bet * 0.02)   # ソロは場所代2%
         bal       = await cesta_cog.get_balance(user.id)
         if bal < bet + venue_fee:
@@ -2171,10 +2197,15 @@ class Chinchiro(commands.Cog):
                 f"セスタ「{c_line('broke')}」", ephemeral=True
             )
 
-        # 場所代引き落とし
+        # 場所代引き落とし＆プレイカウント記録
         async with self.bot.get_db() as db:
             await cesta_cog.sub_balance(db, user.id, bet + venue_fee)
             newly = await cesta_cog.record_spend(db, user.id, bet + venue_fee)
+            await db.execute("""
+                INSERT INTO daily_play_counts (user_id, game, date, count)
+                VALUES (?, 'chinchiro', ?, 1)
+                ON CONFLICT(user_id, game, date) DO UPDATE SET count = count + 1
+            """, (user.id, today))
             await db.commit()
 
         embed = discord.Embed(
@@ -3363,7 +3394,6 @@ _CFG_DEFAULTS = {
     "cesta_daily":         5,
     "cesta_daily_buy_cap": 50,
     "slot_daily_limit":    10,
-    "slot_bet_max":        1000,
     "slot_bigwin_cd":      30,
 }
 
@@ -3531,35 +3561,36 @@ class CestaSystem(commands.Cog):
         embed.set_footer(text=f"本日の購入合計: {today_bought + amount}/{buy_cap} セスタ")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="セスタ設定", description="【管理者】セスタ・スロットの各種設定を変更します")
+    @app_commands.command(name="セスタ設定", description="【管理者】セスタ・スロット・チンチロの各種設定を変更します")
     @app_commands.describe(
         cesta_rate="Stell→セスタ変換レート (N Stell = 1 セスタ)",
         cesta_daily="デイリー配布量（セスタ）",
         cesta_daily_buy_cap="1日の購入上限（セスタ）",
         slot_daily_limit="スロット1日プレイ上限（回）",
-        slot_bet_max="スロット最大ベット（セスタ）",
         slot_bigwin_cd="大勝ち後クールダウン（分）",
+        chinchiro_daily_limit="チンチロソロ1日プレイ上限（回）",
     )
     @has_permission("SUPREME_GOD")
     async def cesta_config(
         self,
         interaction: discord.Interaction,
-        cesta_rate:          Optional[int] = None,
-        cesta_daily:         Optional[int] = None,
-        cesta_daily_buy_cap: Optional[int] = None,
-        slot_daily_limit:    Optional[int] = None,
-        slot_bet_max:        Optional[int] = None,
-        slot_bigwin_cd:      Optional[int] = None,
+        cesta_rate:            Optional[int] = None,
+        cesta_daily:           Optional[int] = None,
+        cesta_daily_buy_cap:   Optional[int] = None,
+        slot_daily_limit:      Optional[int] = None,
+        slot_bigwin_cd:        Optional[int] = None,
+        chinchiro_daily_limit: Optional[int] = None,
     ):
         await interaction.response.defer(ephemeral=True)
         updates = {
-            "cesta_rate":          cesta_rate,
-            "cesta_daily":         cesta_daily,
-            "cesta_daily_buy_cap": cesta_daily_buy_cap,
-            "slot_daily_limit":    slot_daily_limit,
-            "slot_bet_max":        slot_bet_max,
-            "slot_bigwin_cd":      slot_bigwin_cd,
+            "cesta_rate":            cesta_rate,
+            "cesta_daily":           cesta_daily,
+            "cesta_daily_buy_cap":   cesta_daily_buy_cap,
+            "slot_daily_limit":      slot_daily_limit,
+            "slot_bigwin_cd":        slot_bigwin_cd,
+            "chinchiro_daily_limit": chinchiro_daily_limit,
         }
+        
         changed = {k: v for k, v in updates.items() if v is not None}
         if not changed:
             return await interaction.followup.send(
@@ -4684,100 +4715,6 @@ class HumanStockMarket(commands.Cog):
         embed.set_footer(text="株を買うと価格が上がり、売ると下がります。推しをスターに押し上げよう！")
         await interaction.followup.send(embed=embed)
 
-import io
-import datetime
-import matplotlib.pyplot as plt
-import japanize_matplotlib # 日本語を表示するために必須です！
-
-def generate_economy_dashboard(balances, history, flow_stats, type_breakdown, total_asset, avg_asset, active_citizens, active_days):
-    """
-    見やすさ重視・日本語解説付きの縦長ダッシュボード
-    """
-    plt.style.use('dark_background')
-    
-    # スマホ・Discordでそのまま読める縦長レイアウト
-    fig = plt.figure(figsize=(10, 15))
-    gs = fig.add_gridspec(3, 1, height_ratios=[1.2, 1.2, 1.0])
-
-    # --- 1. 上段: マクロ経済推移 ---
-    ax1 = fig.add_subplot(gs[0])
-    try:
-        dates = [r['date'][5:] for r in history]
-        totals = [r['total_balance'] for r in history]
-    except TypeError:
-        dates = [r[0][5:] for r in history]
-        totals = [r[1] for r in history]
-
-    ax1.plot(dates, totals, marker='o', color='#00d2ff', linewidth=3)
-    ax1.fill_between(dates, totals, color='#00d2ff', alpha=0.15)
-    ax1.set_title(f"💰 サーバー全体の資金量推移 (総額: {total_asset:,} S)", fontweight='bold', fontsize=16, pad=15)
-    ax1.grid(True, alpha=0.2, linestyle='--')
-    if len(dates) > 10: ax1.set_xticks(dates[::max(1, len(dates)//7)])
-
-    # --- 2. 中段: 資産分布（格差カーブ） ---
-    ax2 = fig.add_subplot(gs[1])
-    sorted_bal = sorted(balances)
-    count = len(sorted_bal)
-    x_users = list(range(1, count + 1))
-    
-    ax2.plot(x_users, sorted_bal, color='#f1c40f', linewidth=3)
-    ax2.fill_between(x_users, sorted_bal, color='#f1c40f', alpha=0.2)
-    ax2.set_title("⚖️ 市民の資産分布（格差カーブ）", fontweight='bold', fontsize=16, pad=15)
-    ax2.set_xlabel("市民（左から右へ、資産が少ない順 → 多い順）", fontsize=12)
-    ax2.set_ylabel("所持金 (S)", fontsize=12)
-    ax2.grid(True, alpha=0.2, linestyle='--')
-
-    # ジニ係数の計算と日本語での状況判定
-    if total_asset > 0 and count > 0:
-        gini = (2 * sum((i + 1) * v for i, v in enumerate(sorted_bal)) / (count * total_asset)) - (count + 1) / count
-        
-        # 0に近いほど平等、1に近いほど格差が大きい
-        if gini < 0.3: status = "非常に平等な社会です 🕊️"
-        elif gini < 0.4: status = "適度な競争がある正常な経済です 🏃"
-        elif gini < 0.5: status = "少し格差が広がっています ⚠️"
-        else: status = "深刻な格差社会です（一部への富の集中） 🚨"
-    else:
-        gini = 0
-        status = "データなし"
-
-    # グラフ内に判定結果を目立つように表示
-    bbox_props = dict(boxstyle="round,pad=0.5", fc="#2b2d31", ec="#f1c40f", lw=2)
-    ax2.text(0.05, 0.85, f"ジニ係数: {gini:.3f}\n【評価】 {status}", 
-             transform=ax2.transAxes, fontsize=14, color='white', bbox=bbox_props)
-
-    # --- 3. 下段: 日本語の経済サマリーテキスト ---
-    ax3 = fig.add_subplot(gs[2])
-    ax3.axis('off') # 枠線を消す
-    
-    net_flow = flow_stats['mint'] - flow_stats['burn']
-    flow_sign = "+" if net_flow >= 0 else ""
-    median_asset = int(sorted_bal[count//2]) if sorted_bal else 0
-    turnover = (flow_stats['gdp'] / total_asset * 100) if total_asset else 0
-
-    # スッキリと箇条書きでまとめる
-    summary_text = (
-        f"📋 【経済レポート】\n\n"
-        f"👥 アクティブ市民数 : {active_citizens} 人\n"
-        f"🏦 サーバー総資産   : {total_asset:,} S\n"
-        f"📊 平均資産         : {int(avg_asset):,} S\n"
-        f"🎯 中央値(一般的な層): {median_asset:,} S\n\n"
-        f"💸 【24時間のお金の動き】\n"
-        f"📥 発行額(Mint)     : {flow_stats['mint']:,} S\n"
-        f"📤 回収額(Burn)     : {flow_stats['burn']:,} S\n"
-        f"📈 差し引き増加量   : {flow_sign}{net_flow:,} S\n"
-        f"🔄 流通量(GDP)      : {flow_stats['gdp']:,} S  (資金回転率: {turnover:.2f}%)\n"
-    )
-
-    ax3.text(0.1, 0.9, summary_text, transform=ax3.transAxes, fontsize=15, color='white', verticalalignment='top')
-
-    plt.tight_layout()
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=100)
-    buf.seek(0)
-    plt.close(fig)
-    return buf
-
-
 class ServerStats(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -4787,113 +4724,254 @@ class ServerStats(commands.Cog):
     def cog_unload(self):
         self.daily_log_task.cancel()
 
-    async def get_economic_details(self):
-        """経済データを詳細に収集する"""
+    # ── ジニ係数計算 ──────────────────────────────────────
+    def _calc_gini(self, balances: list) -> float:
+        if not balances or sum(balances) == 0:
+            return 0.0
+        s = sorted(balances)
+        n = len(s)
+        total = sum(s)
+        return (2 * sum((i + 1) * v for i, v in enumerate(s)) / (n * total)) - (n + 1) / n
+
+    # ── 市民の残高リストを取得 ─────────────────────────────
+    async def _get_citizen_balances(self) -> list[int]:
         guild = self.bot.guilds[0]
-        if not guild.chunked: await guild.chunk()
+        if not guild.chunked:
+            await guild.chunk()
 
         async with self.bot.get_db() as db:
-            # 1. 設定読み込み
-            god_role_ids = [r_id for r_id, level in self.bot.config.admin_roles.items() if level == "SUPREME_GOD"]
-            citizen_role_id = None
-            active_days = 30
-            async with db.execute("SELECT key, value FROM server_config") as cursor:
-                async for row in cursor:
-                    if row['key'] == 'citizen_role_id': citizen_role_id = int(row['value'])
-                    elif row['key'] == 'active_threshold_days': active_days = int(row['value'])
+            async with db.execute(
+                "SELECT value FROM server_config WHERE key = 'citizen_role_id'"
+            ) as c:
+                row = await c.fetchone()
+            citizen_role_id = int(row["value"]) if row else None
 
-            # 2. アクティブユーザー判定 & 口座取得
-            cutoff = datetime.datetime.now() - datetime.timedelta(days=active_days)
-            async with db.execute("SELECT user_id, balance FROM accounts") as cursor:
-                all_accounts = await cursor.fetchall()
+            god_role_ids = {
+                r_id for r_id, level in self.bot.config.admin_roles.items()
+                if level == "SUPREME_GOD"
+            }
 
-            async with db.execute("SELECT DISTINCT sender_id FROM transactions WHERE created_at > ? UNION SELECT DISTINCT receiver_id FROM transactions WHERE created_at > ?", (cutoff, cutoff)) as cursor:
-                rows = await cursor.fetchall()
-                active_ids = {r[0] for r in rows}
+            async with db.execute("SELECT user_id, balance FROM accounts WHERE user_id != 0") as c:
+                all_accounts = await c.fetchall()
 
-            # 3. 24時間以内の動向分析
-            cutoff_24h = datetime.datetime.now() - datetime.timedelta(days=1)
-            flow_stats = {"mint": 0, "burn": 0, "transfer": 0, "gdp": 0}
-            type_breakdown = {}
-
-            query = "SELECT sender_id, receiver_id, amount, type FROM transactions WHERE created_at > ?"
-            async with db.execute(query, (cutoff_24h,)) as cursor:
-                async for row in cursor:
-                    s_id, r_id, amt, t_type = row['sender_id'], row['receiver_id'], row['amount'], row['type']
-                    flow_stats["gdp"] += amt
-                    type_breakdown[t_type] = type_breakdown.get(t_type, 0) + amt
-                    if s_id == 0: flow_stats["mint"] += amt
-                    elif r_id == 0: flow_stats["burn"] += amt
-                    else: flow_stats["transfer"] += amt
-
-        # 4. 市民データのフィルタリング
-        valid_balances = []
+        balances = []
         for row in all_accounts:
-            uid, bal = row['user_id'], row['balance']
+            uid, bal = row["user_id"], row["balance"]
             member = guild.get_member(uid)
-            if not member or member.bot: continue
-            if any(r.id in god_role_ids for r in member.roles): continue
-            if citizen_role_id and not any(r.id == citizen_role_id for r in member.roles): continue
-            if uid not in active_ids: continue
-            valid_balances.append(bal)
+            if not member or member.bot:
+                continue
+            if any(r.id in god_role_ids for r in member.roles):
+                continue
+            if citizen_role_id and not any(r.id == citizen_role_id for r in member.roles):
+                continue
+            balances.append(bal)
+        return balances
 
-        return valid_balances, flow_stats, type_breakdown, active_days
-
+    # ── 24時間タスク ──────────────────────────────────────
     @tasks.loop(hours=24)
     async def daily_log_task(self):
         try:
-            balances, _, _, _ = await self.get_economic_details()
-            total = sum(balances)
-            today = datetime.datetime.now().strftime("%Y-%m-%d")
+            balances = await self._get_citizen_balances()
+            total    = sum(balances)
+            gini     = self._calc_gini(balances)
+            today    = datetime.datetime.now().strftime("%Y-%m-%d")
+
+            # セスタ総量
             async with self.bot.get_db() as db:
-                await db.execute("CREATE TABLE IF NOT EXISTS daily_stats (date TEXT PRIMARY KEY, total_balance INTEGER)")
-                await db.execute("INSERT OR REPLACE INTO daily_stats (date, total_balance) VALUES (?, ?)", (today, total))
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS daily_stats (
+                        date          TEXT PRIMARY KEY,
+                        total_stell   INTEGER DEFAULT 0,
+                        total_cesta   INTEGER DEFAULT 0,
+                        gini          REAL    DEFAULT 0
+                    )
+                """)
+                async with db.execute("SELECT SUM(balance) FROM cesta_wallets") as c:
+                    row = await c.fetchone()
+                total_cesta = row[0] or 0
+
+                await db.execute("""
+                    INSERT OR REPLACE INTO daily_stats (date, total_stell, total_cesta, gini)
+                    VALUES (?, ?, ?, ?)
+                """, (today, total, total_cesta, gini))
                 await db.commit()
         except Exception as e:
             logger.error(f"Daily Log Error: {e}")
 
-    @app_commands.command(name="経済グラフ", description="サーバー経済の詳細ダッシュボードを生成します（非同期生成）")
+    # ── /経済レポート ──────────────────────────────────────
+    @app_commands.command(name="経済レポート", description="サーバー経済の現状レポートを表示します")
     @has_permission("ADMIN")
-    async def economy_graph(self, interaction: discord.Interaction):
-        # 処理開始を通知（これでタイムアウトを防ぐ）
+    async def economy_report(self, interaction: discord.Interaction):
         await interaction.response.defer()
-        
+
         try:
-            # 1. データの収集（DBアクセスは非同期で軽いのでそのまま）
-            balances, flow_stats, type_breakdown, active_days = await self.get_economic_details()
-            
-            # データ加工
+            # 現在の市民残高
+            balances = await self._get_citizen_balances()
             balances.sort()
-            count = len(balances)
-            total_asset = sum(balances)
-            avg_asset = total_asset / count if count > 0 else 0
+            count       = len(balances)
+            total_stell = sum(balances)
+            avg         = total_stell // count if count else 0
+            median      = balances[count // 2] if balances else 0
+            gini        = self._calc_gini(balances)
 
-            # 履歴データの取得
+            # セスタ総量
             async with self.bot.get_db() as db:
-                async with db.execute("SELECT date, total_balance FROM daily_stats ORDER BY date ASC") as c:
-                    history = await c.fetchall()
+                async with db.execute("SELECT SUM(balance) FROM cesta_wallets") as c:
+                    row = await c.fetchone()
+                total_cesta = row[0] or 0
 
-            # 2. 【重要】グラフ描画を別スレッドで実行
-            # これにより、matplotlibがBot本体の動作を止めるのを防ぎます
-            loop = asyncio.get_running_loop()
-            buf = await loop.run_in_executor(
-                None, 
-                generate_economy_dashboard, 
-                balances, history, flow_stats, type_breakdown, total_asset, avg_asset, count, active_days
+                # 7日前のデータ
+                week_ago = (datetime.datetime.now() - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+                async with db.execute(
+                    "SELECT total_stell, total_cesta, gini FROM daily_stats WHERE date <= ? ORDER BY date DESC LIMIT 1",
+                    (week_ago,)
+                ) as c:
+                    old = await c.fetchone()
+
+                # 24時間の資金フロー（自然 vs 運営操作）
+                cutoff_24h = datetime.datetime.now() - datetime.timedelta(days=1)
+                natural_mint = natural_burn = op_add = op_remove = 0
+                op_add_count = op_remove_count = 0
+
+                async with db.execute(
+                    "SELECT sender_id, receiver_id, amount, type FROM transactions WHERE created_at > ?",
+                    (cutoff_24h,)
+                ) as c:
+                    async for row in c:
+                        s_id, r_id, amt, t_type = row["sender_id"], row["receiver_id"], row["amount"], row["type"]
+                        if t_type == "SYSTEM_ADD":
+                            op_add += amt
+                            op_add_count += 1
+                        elif t_type == "SYSTEM_REMOVE":
+                            op_remove += amt
+                            op_remove_count += 1
+                        elif s_id == 0:
+                            natural_mint += amt
+                        elif r_id == 0:
+                            natural_burn += amt
+
+            # ── ステータス判定 ──
+            # インフレ・デフレ
+            if old and old["total_stell"] > 0:
+                stell_change_pct = (total_stell - old["total_stell"]) / old["total_stell"] * 100
+            else:
+                stell_change_pct = None
+
+            if stell_change_pct is None:
+                inflation_status = "- 比較データなし"
+            elif stell_change_pct >= 5:
+                inflation_status = "🔴 深刻なインフレ"
+            elif stell_change_pct >= 2:
+                inflation_status = "🟠 インフレ傾向"
+            elif stell_change_pct >= -2:
+                inflation_status = "🟢 安定"
+            elif stell_change_pct >= -5:
+                inflation_status = "🟡 デフレ傾向"
+            else:
+                inflation_status = "🔴 深刻なデフレ"
+
+            # 格差
+            old_gini = old["gini"] if old else None
+            gini_diff = gini - old_gini if old_gini is not None else None
+
+            if count == 0:
+                gap_status = "- データなし"
+            elif gini < 0.3:
+                gap_status = "🟢 健全"
+            elif gini < 0.4:
+                gap_status = "🟡 格差あり"
+            elif gini < 0.5 or (gini_diff is not None and gini_diff > 0.03):
+                gap_status = "🟠 格差拡大中"
+            else:
+                gap_status = "🔴 深刻な格差"
+
+            # ── 変化表示 ──
+            def diff_str(new, old_val, unit="S"):
+                if old_val is None or old_val == 0:
+                    return ""
+                diff = new - old_val
+                pct  = diff / old_val * 100
+                sign = "+" if diff >= 0 else ""
+                return f"（先週比 {sign}{pct:.1f}%）"
+
+            stell_diff  = diff_str(total_stell, old["total_stell"] if old else None)
+            cesta_diff  = diff_str(total_cesta, old["total_cesta"] if old else None, "C")
+            gini_str    = f"{gini:.3f}"
+            if gini_diff is not None:
+                arrow = "↑" if gini_diff > 0 else "↓" if gini_diff < 0 else "→"
+                gini_str += f"（先週 {old_gini:.3f} {arrow}）"
+
+            natural_net  = natural_mint - natural_burn
+            natural_sign = "+" if natural_net >= 0 else ""
+
+            # ── Embed構築 ──
+            embed = discord.Embed(title="経済レポート", color=0x2b2d31)
+            embed.description = (
+                f"{inflation_status}\n"
+                f"{gap_status}\n"
             )
 
-            # 3. 結果の送信
-            file = discord.File(buf, filename="economy_dashboard.png")
-            
-            embed = discord.Embed(title="📊 ステラ経済ダッシュボード", color=0x2b2d31)
-            embed.set_image(url="attachment://economy_dashboard.png")
-            embed.set_footer(text=f"Generated in background thread | {datetime.datetime.now().strftime('%H:%M:%S')}")
+            embed.add_field(
+                name="Stell",
+                value=(
+                    f"`{total_stell:,} S` {stell_diff}\n"
+                    f"平均 {avg:,} S　中央値 {median:,} S\n"
+                    f"市民 {count} 人"
+                ),
+                inline=False
+            )
+            embed.add_field(
+                name="セスタ",
+                value=f"`{total_cesta:,} C` {cesta_diff}",
+                inline=False
+            )
+            embed.add_field(
+                name="ジニ係数",
+                value=gini_str,
+                inline=False
+            )
+            embed.add_field(
+                name="24時間の自然な動き",
+                value=(
+                    f"発行　+{natural_mint:,} S\n"
+                    f"回収　-{natural_burn:,} S\n"
+                    f"純増　{natural_sign}{natural_net:,} S"
+                ),
+                inline=False
+            )
+            if op_add > 0 or op_remove > 0:
+                embed.add_field(
+                    name="運営操作",
+                    value=(
+                        f"付与　+{op_add:,} S（{op_add_count}件）\n"
+                        f"没収　-{op_remove:,} S（{op_remove_count}件）"
+                    ),
+                    inline=False
+                )
+            embed.set_footer(text=datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
 
-            await interaction.followup.send(embed=embed, file=file)
+            await interaction.followup.send(embed=embed)
 
         except Exception as e:
+            logger.error(f"Economy Report Error: {e}")
             traceback.print_exc()
             await interaction.followup.send(f"❌ レポート生成中にエラーが発生しました: {e}")
+
+    # ── /市民ロール設定 ────────────────────────────────────
+    @app_commands.command(name="市民ロール設定", description="【管理者】経済レポートの対象となる市民ロールを設定します")
+    @app_commands.describe(role="市民ロール")
+    @has_permission("SUPREME_GOD")
+    async def set_citizen_role(self, interaction: discord.Interaction, role: discord.Role):
+        async with self.bot.get_db() as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO server_config (key, value) VALUES ('citizen_role_id', ?)",
+                (str(role.id),)
+            )
+            await db.commit()
+        await interaction.response.send_message(
+            f"✅ 市民ロールを {role.mention} に設定しました。", ephemeral=True
+        )
+
 
 # --- 購入確認View ---
 class ShopPurchaseView(discord.ui.View):
