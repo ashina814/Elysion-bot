@@ -345,7 +345,8 @@ class BankDatabase:
             item_id      TEXT,
             item_name    TEXT,
             purchased_at TEXT,
-            used_at      TEXT
+            used_at      TEXT,
+            used_by      INTEGER
         )""")
         await conn.execute("""CREATE TABLE IF NOT EXISTS cesta_badge_thresholds (
             badge_id     TEXT PRIMARY KEY,
@@ -2629,9 +2630,18 @@ class BlackjackView(discord.ui.View):
         result += f"\n\n賭け金: **{self.bet:,} セスタ** | 結果: **{'+' if net >= 0 else ''}{net:,} セスタ**"
 
         async with self.cog.bot.get_db() as db:
-            if payout > 0:
-                await self.cesta_cog.add_balance(db, interaction.user.id, payout)
-            await db.commit()
+            try:
+                if payout > 0:
+                    await self.cesta_cog.add_balance(db, interaction.user.id, payout)
+                await db.commit()
+            except Exception as e:
+                await db.rollback()
+                logger.error(f"BJ _finish DB error (user={interaction.user.id}): {e}")
+                await interaction.response.edit_message(
+                    content="❌ 精算処理中にエラーが発生しました。管理者にお問い合わせください。",
+                    embed=None, view=None
+                )
+                return
 
         embed = self._embed(hide_sesta=False, result_text=result, color=color)
         await interaction.response.edit_message(embed=embed, view=None)
@@ -2725,23 +2735,39 @@ class Blackjack(commands.Cog):
         player_hand = [deck.pop(), deck.pop()]
         sesta_hand  = [deck.pop(), deck.pop()]
 
-        p_val = bj_hand_value(player_hand)
-        if p_val == 21:
-            payout = int(bet * 2.5)
-            async with self.bot.get_db() as db:
-                await cesta_cog.add_balance(db, user.id, payout)
-                await db.commit()
-            result = f"🌟 **ブラックジャック！**\nセスタ「{c_line_bj('blackjack')}」\n\n賭け金: **{bet:,} セスタ** | 結果: **+{payout - bet:,} セスタ**"
-            embed = discord.Embed(title="🃏 ブラックジャック vsセスタ", description=(
-                f"**あなたの手札**: {bj_card_str(player_hand)}  `{p_val}`\n"
-                f"**セスタの手札**: {bj_card_str(sesta_hand)}  `{bj_hand_value(sesta_hand)}`\n\n{result}"
-            ), color=discord.Color.gold())
-            return await interaction.response.send_message(embed=embed, ephemeral=True)
+p_val = bj_hand_value(player_hand)
+s_val = bj_hand_value(sesta_hand)
 
-        view  = BlackjackView(self, interaction, bet, player_hand, sesta_hand, deck, cesta_cog)
-        embed = view._embed()
-        embed.set_footer(text=f"セスタ「{c_line_bj('deal')}」")
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+if p_val == 21:
+    if s_val == 21:
+        # 両者BJ → 引き分け、賭け金をそのまま返す
+        payout = bet
+        async with self.bot.get_db() as db:
+            await cesta_cog.add_balance(db, user.id, payout)
+            await db.commit()
+        result = f"🟡 **引き分け（両者ブラックジャック）！**\nセスタ「{c_line_bj('draw')}」\n\n賭け金: **{bet:,} セスタ** | 結果: **±0 セスタ**"
+        embed = discord.Embed(title="🃏 ブラックジャック vsセスタ", description=(
+            f"**あなたの手札**: {bj_card_str(player_hand)}  `{p_val}`\n"
+            f"**セスタの手札**: {bj_card_str(sesta_hand)}  `{s_val}`\n\n{result}"
+        ), color=discord.Color.yellow())
+        return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # プレイヤーのみBJ → 2.5倍
+    payout = int(bet * 2.5)
+    async with self.bot.get_db() as db:
+        await cesta_cog.add_balance(db, user.id, payout)
+        await db.commit()
+    result = f"🌟 **ブラックジャック！**\nセスタ「{c_line_bj('blackjack')}」\n\n賭け金: **{bet:,} セスタ** | 結果: **+{payout - bet:,} セスタ**"
+    embed = discord.Embed(title="🃏 ブラックジャック vsセスタ", description=(
+        f"**あなたの手札**: {bj_card_str(player_hand)}  `{p_val}`\n"
+        f"**セスタの手札**: {bj_card_str(sesta_hand)}  `{s_val}`\n\n{result}"
+    ), color=discord.Color.gold())
+    return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+view  = BlackjackView(self, interaction, bet, player_hand, sesta_hand, deck, cesta_cog)
+embed = view._embed()
+embed.set_footer(text=f"セスタ「{c_line_bj('deal')}」")
+await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         
 # --- 色定義 ---
 def ansi(text, color_code): return f"\x1b[{color_code}m{text}\x1b[0m"
@@ -3115,7 +3141,12 @@ class CestaSystem(commands.Cog):
         """, (user_id, amount))
 
     async def sub_balance(self, db, user_id: int, amount: int) -> bool:
-        bal = await self.get_balance(user_id)
+        # 同一トランザクション内で残高チェック＋引き落としを行う（競合防止）
+        async with db.execute(
+            "SELECT balance FROM cesta_wallets WHERE user_id = ?", (user_id,)
+        ) as c:
+            row = await c.fetchone()
+        bal = row["balance"] if row else 0
         if bal < amount:
             return False
         await db.execute(
@@ -3628,31 +3659,42 @@ class CestaShop(commands.Cog):
                 )
             newly = await cesta_cog.record_spend(db, user_id, item["price"])
 
-            if item["item_type"] == "role":
-                # ロール付与
-                if item["role_id"]:
-                    role = interaction.guild.get_role(int(item["role_id"]))
-                    if role:
-                        await interaction.user.add_roles(role, reason=f"セスタショップ購入: {item['name']}")
+            try:
+                if item["item_type"] == "role":
+                    # ロール付与
+                    if item["role_id"]:
+                        role = interaction.guild.get_role(int(item["role_id"]))
+                        if role:
+                            await interaction.user.add_roles(role, reason=f"セスタショップ購入: {item['name']}")
 
-                # 期限管理
-                if item["duration_days"] > 0:
-                    expiry = (now + datetime.timedelta(days=item["duration_days"])).isoformat()
+                    # 期限管理
+                    if item["duration_days"] > 0:
+                        expiry = (now + datetime.timedelta(days=item["duration_days"])).isoformat()
+                        await db.execute("""
+                            INSERT INTO cesta_shop_subs (user_id, item_id, expiry)
+                            VALUES (?, ?, ?)
+                            ON CONFLICT(user_id, item_id) DO UPDATE SET expiry = excluded.expiry
+                        """, (user_id, item_id, expiry))
+
+                elif item["item_type"] == "ticket":
+                    # 商品券をインベントリに追加
                     await db.execute("""
-                        INSERT INTO cesta_shop_subs (user_id, item_id, expiry)
-                        VALUES (?, ?, ?)
-                        ON CONFLICT(user_id, item_id) DO UPDATE SET expiry = excluded.expiry
-                    """, (user_id, item_id, expiry))
+                        INSERT INTO cesta_tickets (user_id, item_id, item_name, purchased_at)
+                        VALUES (?, ?, ?, ?)
+                    """, (user_id, item_id, item["name"], now.isoformat()))
 
-            elif item["item_type"] == "ticket":
-                # 商品券をインベントリに追加
-                await db.execute("""
-                    INSERT INTO cesta_tickets (user_id, item_id, item_name, purchased_at)
-                    VALUES (?, ?, ?, ?)
-                """, (user_id, item_id, item["name"], now.isoformat()))
+                await db.commit()
 
-            await db.commit()
-
+            except Exception as e:
+                # ロール付与等に失敗したらロールバックしてセスタを返す
+                await db.rollback()
+                logger.error(f"CestaShop purchase error (user={user_id}, item={item_id}): {e}")
+                return await interaction.followup.send(
+                    "❌ 購入処理中にエラーが発生しました。セスタは消費されていません。\n"
+                    "時間をおいて再度お試しください。",
+                    ephemeral=True
+                )
+                
         new_bal = await cesta_cog.get_balance(user_id)
 
         embed = discord.Embed(
@@ -3898,11 +3940,17 @@ class CestaShop(commands.Cog):
                             removed.append(f"{user.display_name} / {e['name']}")
                         except Exception as ex:
                             errors.append(f"{e['user_id']}: {ex}")
-                await db.execute(
-                    "DELETE FROM cesta_shop_subs WHERE user_id = ? AND item_id = ?",
-                    (e["user_id"], e["item_id"])
-                )
+                    else:
+                    # ユーザーがサーバーにいない場合はDBだけ消してOK
+                        role_removed = True
+
+                    if role_removed:
+                    await db.execute(
+                        "DELETE FROM cesta_shop_subs WHERE user_id = ? AND item_id = ?",
+                        (e["user_id"], e["item_id"])
+                    )
             await db.commit()
+            
         lines = "\n".join(f"🗑️ {r}" for r in removed) or "なし"
         embed = discord.Embed(title="🗑️ 期限切れ処理完了", color=0x9b59b6)
         embed.add_field(name=f"剥奪({len(removed)}件)", value=lines, inline=False)
