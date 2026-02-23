@@ -2712,6 +2712,11 @@ class Blackjack(commands.Cog):
         async with self.bot.get_db() as db:
             await cesta_cog.sub_balance(db, user.id, bet)
             await cesta_cog.record_spend(db, user.id, bet)
+            await db.execute("""
+                INSERT INTO daily_play_counts (user_id, game, date, count)
+                VALUES (?, 'blackjack', ?, 1)
+                ON CONFLICT(user_id, game, date) DO UPDATE SET count = count + 1
+            """, (user.id, today))
             await db.commit()
 
         deck        = bj_new_deck()
