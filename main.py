@@ -2273,17 +2273,22 @@ class Chinchiro(commands.Cog):
                 f"セスタ「{c_line('cooldown', sec=rem)}」", ephemeral=True
             )
 
-        # ── 日次プレイ上限チェック ──
+# ── 日次プレイ上限チェック ──
         today = datetime.datetime.now().strftime("%Y-%m-%d")
         daily_limit = await _cfg(self.bot, "chinchiro_daily_limit")
         async with self.bot.get_db() as db:
+            async with db.execute(
+                "SELECT 1 FROM daily_play_exemptions WHERE user_id=? AND game='chinchiro' AND date=?",
+                (user.id, today)
+            ) as c:
+                exempt = await c.fetchone()
             async with db.execute(
                 "SELECT count FROM daily_play_counts WHERE user_id=? AND game='chinchiro' AND date=?",
                 (user.id, today)
             ) as c:
                 row = await c.fetchone()
             play_count = row["count"] if row else 0
-        if play_count >= daily_limit:
+        if not exempt and play_count >= daily_limit:
             return await interaction.response.send_message(
                 f"🚫 今日のチンチロ上限（**{daily_limit}回**）に達したよ！また明日ね〜♪",
                 ephemeral=True
@@ -5588,7 +5593,7 @@ class AdminTools(commands.Cog):
         game="解除するゲーム"
     )
     @app_commands.choices(game=[
-        app_commands.Choice(name="チンチロ", value="chinchiro_solo"),
+        app_commands.Choice(name="チンチロ", value="chinchiro"),
         app_commands.Choice(name="スロット", value="slot"),
         app_commands.Choice(name="両方", value="all"),
     ])
