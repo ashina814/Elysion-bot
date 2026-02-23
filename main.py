@@ -3941,15 +3941,16 @@ class CestaShop(commands.Cog):
                         except Exception as ex:
                             errors.append(f"{e['user_id']}: {ex}")
                     else:
-                    # ユーザーがサーバーにいない場合はDBだけ消してOK
+                        # ユーザーがサーバーにいない場合はDBだけ消してOK
                         role_removed = True
 
                     if role_removed:
-                    await db.execute(
-                        "DELETE FROM cesta_shop_subs WHERE user_id = ? AND item_id = ?",
-                        (e["user_id"], e["item_id"])
-                    )
+                        await db.execute(
+                            "DELETE FROM cesta_shop_subs WHERE user_id = ? AND item_id = ?",
+                            (e["user_id"], e["item_id"])
+                        )
             await db.commit()
+
             
         lines = "\n".join(f"🗑️ {r}" for r in removed) or "なし"
         embed = discord.Embed(title="🗑️ 期限切れ処理完了", color=0x9b59b6)
