@@ -144,7 +144,6 @@ class BankDatabase:
             dm_salary_enabled INTEGER DEFAULT 1
         )""")
 
-                # 3. VC関連
         
         
         # ▼ 月間対応の新しいテーブルを作成
@@ -223,13 +222,15 @@ class BankDatabase:
             )
         """)
 
+        await conn.execute("DROP TABLE IF EXISTS daily_stats")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS daily_stats (
-                date TEXT PRIMARY KEY,
-                total_balance INTEGER
+                date          TEXT PRIMARY KEY,
+                total_stell   INTEGER DEFAULT 0,
+                total_cesta   INTEGER DEFAULT 0,
+                gini          REAL    DEFAULT 0
             )
         """)
-
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS stock_issuers (
                 user_id INTEGER PRIMARY KEY,
@@ -867,6 +868,109 @@ class Economy(commands.Cog):
         )
         embed.set_footer(text="制限は毎日0時にリセットされます")
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # === ゴミ拾い ===
+    @app_commands.command(name="ゴミ拾い", description="ゴミを拾ってStellを稼ぎます（残高500以下限定・1日30回まで）")
+    async def gomi_hiroi(self, interaction: discord.Interaction):
+        user_id = interaction.user.id
+        today   = datetime.datetime.now().strftime("%Y-%m-%d")
+
+        async with self.bot.get_db() as db:
+            # 残高チェック
+            async with db.execute(
+                "SELECT balance FROM accounts WHERE user_id = ?", (user_id,)
+            ) as c:
+                row = await c.fetchone()
+            bal = row["balance"] if row else 0
+
+            if bal > 500:
+                return await interaction.response.send_message(
+                    "❌ 残高が500 Stellを超えているのでゴミ拾いはできません。",
+                    ephemeral=True
+                )
+
+            # 日次上限チェック
+            async with db.execute(
+                "SELECT count FROM daily_play_counts WHERE user_id=? AND game='gomi' AND date=?",
+                (user_id, today)
+            ) as c:
+                row = await c.fetchone()
+            count = row["count"] if row else 0
+
+            if count >= 30:
+                return await interaction.response.send_message(
+                    "🚫 今日のゴミ拾いは上限（30回）に達しました。また明日ね。",
+                    ephemeral=True
+                )
+
+            # イースターエッグ抽選
+            roll = random.random() * 100
+            if roll < 0.1:
+                # 釈迦から特別（0.1%）
+                amount  = 10000
+                gain    = amount
+                message = "✨ 釈迦「**特別やで**」\n**10,000 Stell** もらった！"
+            elif roll < 1.1:
+                # 涅槃（1%）
+                amount  = 0
+                gain    = 0
+                message = "🪷 涅槃に達した…お金への執着を手放した。\n**(+0 Stell)**"
+            elif roll < 9.1:
+                # 煩悩（8%）
+                amount  = -random.randint(100, 300)
+                gain    = max(amount, -bal)  # マイナスにならないよう調整
+                message = f"😩 煩悩を拾ってしまった…108の苦しみ。\n**{gain:,} Stell**"
+            elif roll < 14.1:
+                # お賽銭（5%）
+                amount  = random.randint(2000, 5000)
+                gain    = amount
+                message = f"👛 釈迦の財布を発見！功徳が積まれた！\n**+{gain:,} Stell**"
+            elif roll < 29.1:
+                # お賽銭（15%）
+                amount  = random.randint(50, 200)
+                gain    = amount
+                message = f"🪙 お賽銭を拾った…ありがたや。\n**+{gain:,} Stell**"
+            else:
+                # 通常（76.9%）
+                amount  = random.randint(500, 1000)
+                gain    = amount
+                message = f"🗑️ ゴミを拾って **+{gain:,} Stell** 稼いだ！"
+
+            # 残高反映
+            if gain != 0:
+                await db.execute("""
+                    INSERT INTO accounts (user_id, balance, total_earned) VALUES (?, MAX(0, ?), MAX(0, ?))
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        balance      = MAX(0, balance + ?),
+                        total_earned = total_earned + MAX(0, ?)
+                """, (user_id, gain, max(gain, 0), gain, max(gain, 0)))
+
+                month_tag = datetime.datetime.now().strftime("%Y-%m")
+                if gain > 0:
+                    await db.execute("""
+                        INSERT INTO transactions (sender_id, receiver_id, amount, type, description, month_tag)
+                        VALUES (0, ?, ?, 'GOMI', 'ゴミ拾い', ?)
+                    """, (user_id, gain, month_tag))
+                else:
+                    await db.execute("""
+                        INSERT INTO transactions (sender_id, receiver_id, amount, type, description, month_tag)
+                        VALUES (?, 0, ?, 'GOMI', 'ゴミ拾い（煩悩）', ?)
+                    """, (user_id, abs(gain), month_tag))
+
+            await db.execute("""
+                INSERT INTO daily_play_counts (user_id, game, date, count) VALUES (?, 'gomi', ?, 1)
+                ON CONFLICT(user_id, game, date) DO UPDATE SET count = count + 1
+            """, (user_id, today))
+
+            await db.commit()
+
+        new_bal = max(0, bal + gain)
+        remaining = 29 - count
+        await interaction.response.send_message(
+            f"{message}\n"
+            f"残高: {new_bal:,} Stell　|　今日の残り: {remaining} 回",
+            ephemeral=True
+        )
         
     # === 追加機能1: 所持金ランキング ===
     @app_commands.command(name="ランキング", description="サーバー内の大富豪トップ10を表示します")
@@ -5479,30 +5583,6 @@ class AdminTools(commands.Cog):
         channels_text = "\n".join([f"• <#{row['channel_id']}>" for row in rows])
         embed = discord.Embed(title="🎙 報酬対象VC一覧", description=channels_text, color=discord.Color.green())
         await interaction.followup.send(embed=embed, ephemeral=True)
-
-    @app_commands.command(name="経済集計ロール付与", description="経済統計の対象とする「市民ロール」を設定します")
-    @has_permission("SUPREME_GOD")
-    async def config_citizen_role(self, interaction: discord.Interaction, role: discord.Role):
-        await interaction.response.defer(ephemeral=True)
-        async with self.bot.get_db() as db:
-            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES ('citizen_role_id', ?)", (str(role.id),))
-            await db.commit()
-        await self.bot.config.reload()
-        await interaction.followup.send(f"✅ 経済統計の対象を **{role.name}** を持つメンバーに限定しました。", ephemeral=True)
-        
-    @app_commands.command(name="経済集計アクティブ判定期間", description="経済統計に含める「アクティブ期間（日数）」を設定します")
-    @app_commands.describe(days="この日数以内に取引がない人は、市民ロールを持っていても計算から除外されます（推奨: 30）")
-    @has_permission("SUPREME_GOD")
-    async def config_active_days(self, interaction: discord.Interaction, days: int):
-        await interaction.response.defer(ephemeral=True)
-        if days < 1:
-            return await interaction.followup.send("❌ 1日以上を設定してください。", ephemeral=True)
-            
-        async with self.bot.get_db() as db:
-            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES ('active_threshold_days', ?)", (str(days),))
-            await db.commit()
-        await self.bot.config.reload()
-        await interaction.followup.send(f"✅ 過去 **{days}日間** に取引がないメンバーを、経済統計から除外するように設定しました。", ephemeral=True)
 
 
     @app_commands.command(name="ギャンブル制限解除", description="【管理者】指定ユーザーまたはロールの今日のプレイ制限を解除します")
