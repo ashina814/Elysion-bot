@@ -4000,6 +4000,227 @@ class CestaShop(commands.Cog):
             ) as c:
                 row = await c.fetchone()
         return row["total_spent"] if row else 0
+
+# ── /セスタショップ_商品登録 ───────────────────────────
+    @app_commands.command(name="セスタショップ_商品登録", description="【管理者】セスタショップに商品を登録します")
+    @app_commands.describe(
+        item_id="商品ID（英数字推奨、例: joker_role）",
+        name="商品名",
+        description="商品説明",
+        price="価格（セスタ）",
+        item_type="商品種別",
+        required_badge="必要バッジ（不要なら空欄）",
+        role="付与するロール（ロール商品の場合）",
+        duration_days="ロールの有効期限（日数、0で永続）",
+    )
+    @app_commands.choices(
+        item_type=[
+            app_commands.Choice(name="ロール", value="role"),
+            app_commands.Choice(name="商品券", value="ticket"),
+        ],
+        required_badge=[
+            app_commands.Choice(name="なし",       value=""),
+            app_commands.Choice(name="🎟️ 入場券",    value="入場券"),
+            app_commands.Choice(name="🃏 道化師の証", value="道化師の証"),
+            app_commands.Choice(name="🎪 座長の印",  value="座長の印"),
+        ]
+    )
+    @has_permission("SUPREME_GOD")
+    async def shop_add_item(
+        self,
+        interaction: discord.Interaction,
+        item_id:        str,
+        name:           str,
+        description:    str,
+        price:          int,
+        item_type:      str,
+        required_badge: str = "",
+        role:           Optional[discord.Role] = None,
+        duration_days:  int = 0,
+    ):
+        if price <= 0:
+            return await interaction.response.send_message(
+                "❌ 価格は1以上を指定してください。", ephemeral=True
+            )
+        if item_type == "role" and not role:
+            return await interaction.response.send_message(
+                "❌ ロール商品にはロールを指定してください。", ephemeral=True
+            )
+        role_id = role.id if role else None
+        async with self.bot.get_db() as db:
+            await db.execute("""
+                INSERT OR REPLACE INTO cesta_shop_items
+                    (item_id, name, description, price, item_type, required_badge, role_id, duration_days)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                item_id, name, description, price,
+                item_type, required_badge or None,
+                role_id, duration_days
+            ))
+            await db.commit()
+        embed = discord.Embed(title="✅ 商品登録完了", color=0x9b59b6)
+        itype = "ロール" if item_type == "role" else "商品券"
+        dur   = f"{duration_days}日間" if duration_days > 0 else "永続" if item_type == "role" else "-"
+        embed.add_field(name="商品ID",   value=item_id,           inline=True)
+        embed.add_field(name="商品名",   value=name,              inline=True)
+        embed.add_field(name="価格",     value=f"{price:,} セスタ", inline=True)
+        embed.add_field(name="種別",     value=f"{itype} / {dur}", inline=True)
+        embed.add_field(
+            name="必要バッジ",
+            value=f"{BADGE_EMOJI.get(required_badge, '')} {required_badge}" if required_badge else "なし",
+            inline=True
+        )
+        if role:
+            embed.add_field(name="付与ロール", value=role.mention, inline=True)
+        embed.add_field(name="説明", value=description, inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ── /セスタショップ_商品削除 ───────────────────────────
+    @app_commands.command(name="セスタショップ_商品削除", description="【管理者】セスタショップから商品を削除します")
+    @app_commands.describe(item_id="削除する商品ID")
+    @has_permission("SUPREME_GOD")
+    async def shop_remove_item(self, interaction: discord.Interaction, item_id: str):
+        async with self.bot.get_db() as db:
+            async with db.execute(
+                "SELECT name FROM cesta_shop_items WHERE item_id = ?", (item_id,)
+            ) as c:
+                row = await c.fetchone()
+        if not row:
+            return await interaction.response.send_message(
+                "❌ 商品が見つかりません。", ephemeral=True
+            )
+        async with self.bot.get_db() as db:
+            await db.execute("DELETE FROM cesta_shop_items WHERE item_id = ?", (item_id,))
+            await db.commit()
+        await interaction.response.send_message(
+            f"🗑️ **{row['name']}**（{item_id}）を削除しました。", ephemeral=True
+        )
+
+    # ── /セスタショップ_商品一覧 ───────────────────────────
+    @app_commands.command(name="セスタショップ_商品一覧", description="【管理者】登録済み商品の一覧を確認します")
+    @has_permission("ADMIN")
+    async def shop_list_items(self, interaction: discord.Interaction):
+        async with self.bot.get_db() as db:
+            async with db.execute(
+                "SELECT * FROM cesta_shop_items ORDER BY required_badge ASC, price ASC"
+            ) as c:
+                items = await c.fetchall()
+        if not items:
+            return await interaction.response.send_message(
+                "📝 登録されている商品はありません。", ephemeral=True
+            )
+        embed = discord.Embed(title="📦 セスタショップ 商品一覧", color=0x9b59b6)
+        for item in items:
+            itype = "ロール" if item["item_type"] == "role" else "商品券"
+            dur   = f"{item['duration_days']}日" if item["duration_days"] > 0 else "永続" if item["item_type"] == "role" else "-"
+            rb    = f"{BADGE_EMOJI.get(item['required_badge'], '')} {item['required_badge']}" if item["required_badge"] else "なし"
+            embed.add_field(
+                name=f"`{item['item_id']}` {item['name']}",
+                value=(
+                    f"💜 {item['price']:,} セスタ　｜ {itype} / {dur}\n"
+                    f"必要バッジ: {rb}\n"
+                    f"{item['description']}"
+                ),
+                inline=False
+            )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ── /セスタショップ_ロール期限確認 ─────────────────────
+    @app_commands.command(name="セスタショップ_ロール期限確認", description="【管理者】期限付きロールの有効期限一覧を確認します")
+    @has_permission("ADMIN")
+    async def shop_check_subs(self, interaction: discord.Interaction):
+        async with self.bot.get_db() as db:
+            async with db.execute("""
+                SELECT s.user_id, s.item_id, s.expiry, i.name, i.role_id
+                FROM cesta_shop_subs s
+                JOIN cesta_shop_items i ON s.item_id = i.item_id
+                ORDER BY s.expiry ASC
+            """) as c:
+                subs = await c.fetchall()
+        if not subs:
+            return await interaction.response.send_message(
+                "📝 期限付きロールの購入者はいません。", ephemeral=True
+            )
+        now   = datetime.datetime.now()
+        embed = discord.Embed(title="⏰ 期限付きロール一覧", color=0x9b59b6)
+        for s in subs:
+            expiry  = datetime.datetime.fromisoformat(s["expiry"])
+            expired = expiry < now
+            user    = interaction.guild.get_member(s["user_id"])
+            uname   = user.display_name if user else f"ID:{s['user_id']}"
+            status  = "❌ 期限切れ" if expired else f"✅ {expiry.strftime('%Y/%m/%d')}"
+            embed.add_field(name=f"{uname} / {s['name']}", value=status, inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ── /セスタショップ_期限切れ処理 ──────────────────────
+    @app_commands.command(name="セスタショップ_期限切れ処理", description="【管理者】期限切れロールを一括で剥奪します")
+    @has_permission("SUPREME_GOD")
+    async def shop_expire_roles(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        now = datetime.datetime.now()
+        async with self.bot.get_db() as db:
+            async with db.execute("""
+                SELECT s.user_id, s.item_id, i.name, i.role_id
+                FROM cesta_shop_subs s
+                JOIN cesta_shop_items i ON s.item_id = i.item_id
+                WHERE s.expiry < ?
+            """, (now.isoformat(),)) as c:
+                expired = await c.fetchall()
+        if not expired:
+            return await interaction.followup.send("✅ 期限切れのロールはありません。", ephemeral=True)
+        removed = []
+        errors  = []
+        async with self.bot.get_db() as db:
+            for e in expired:
+                user = interaction.guild.get_member(e["user_id"])
+                if user and e["role_id"]:
+                    role = interaction.guild.get_role(int(e["role_id"]))
+                    if role:
+                        try:
+                            await user.remove_roles(role, reason="セスタショップ期限切れ")
+                            removed.append(f"{user.display_name} / {e['name']}")
+                        except Exception as ex:
+                            errors.append(f"{e['user_id']}: {ex}")
+                await db.execute(
+                    "DELETE FROM cesta_shop_subs WHERE user_id = ? AND item_id = ?",
+                    (e["user_id"], e["item_id"])
+                )
+            await db.commit()
+        lines = "\n".join(f"🗑️ {r}" for r in removed) or "なし"
+        embed = discord.Embed(title="🗑️ 期限切れ処理完了", color=0x9b59b6)
+        embed.add_field(name=f"剥奪({len(removed)}件)", value=lines, inline=False)
+        if errors:
+            embed.add_field(name="エラー", value="\n".join(errors), inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    # ── /セスタショップ_チケット使用 ──────────────────────
+    @app_commands.command(name="セスタショップ_チケット使用", description="【管理者】ユーザーの商品券を使用済みにします")
+    @app_commands.describe(ticket_id="チケットID（/セスタチケット確認 で確認）", user="対象ユーザー")
+    @has_permission("ADMIN")
+    async def shop_use_ticket(
+        self, interaction: discord.Interaction,
+        user: discord.Member, ticket_id: int
+    ):
+        now = datetime.datetime.now()
+        async with self.bot.get_db() as db:
+            async with db.execute(
+                "SELECT * FROM cesta_tickets WHERE id = ? AND user_id = ? AND used_at IS NULL",
+                (ticket_id, user.id)
+            ) as c:
+                ticket = await c.fetchone()
+            if not ticket:
+                return await interaction.response.send_message(
+                    "❌ チケットが見つからないか、すでに使用済みです。", ephemeral=True
+                )
+            await db.execute(
+                "UPDATE cesta_tickets SET used_at = ?, used_by = ? WHERE id = ?",
+                (now.isoformat(), interaction.user.id, ticket_id)
+            )
+            await db.commit()
+        await interaction.response.send_message(
+            f"✅ {user.mention} の **{ticket['item_name']}**（#{ticket_id}）を使用済みにしました。",
+            ephemeral=True
+        )
                 
 # ==========================================
 #  人間株式市場 (完全版: スター豪華演出 + 昇格システム)
@@ -4127,252 +4348,6 @@ class StockControlView(discord.ui.View):
         else:
             await interaction.response.send_message(msg, ephemeral=True)
 
-#── /セスタショップ_商品登録 ───────────────────────────
-    @app_commands.command(name="セスタショップ_商品登録", description="【管理者】セスタショップに商品を登録します")
-    @app_commands.describe(
-        item_id="商品ID（英数字推奨、例: joker_role）",
-        name="商品名",
-        description="商品説明",
-        price="価格（セスタ）",
-        item_type="商品種別",
-        required_badge="必要バッジ（不要なら空欄）",
-        role="付与するロール（ロール商品の場合）",
-        duration_days="ロールの有効期限（日数、0で永続）",
-    )
-    @app_commands.choices(
-        item_type=[
-            app_commands.Choice(name="ロール", value="role"),
-            app_commands.Choice(name="商品券", value="ticket"),
-        ],
-        required_badge=[
-            app_commands.Choice(name="なし",       value=""),
-            app_commands.Choice(name="🎟️ 入場券",    value="入場券"),
-            app_commands.Choice(name="🃏 道化師の証", value="道化師の証"),
-            app_commands.Choice(name="🎪 座長の印",  value="座長の印"),
-        ]
-    )
-    @has_permission("SUPREME_GOD")
-    async def shop_add_item(
-        self,
-        interaction: discord.Interaction,
-        item_id:       str,
-        name:          str,
-        description:   str,
-        price:         int,
-        item_type:     str,
-        required_badge: str = "",
-        role:          Optional[discord.Role] = None,
-        duration_days: int = 0,
-    ):
-        if price <= 0:
-            return await interaction.response.send_message(
-                "❌ 価格は1以上を指定してください。", ephemeral=True
-            )
-        if item_type == "role" and not role:
-            return await interaction.response.send_message(
-                "❌ ロール商品にはロールを指定してください。", ephemeral=True
-            )
-
-        role_id = role.id if role else None
-
-        async with self.bot.get_db() as db:
-            await db.execute("""
-                INSERT OR REPLACE INTO cesta_shop_items
-                    (item_id, name, description, price, item_type, required_badge, role_id, duration_days)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                item_id, name, description, price,
-                item_type, required_badge or None,
-                role_id, duration_days
-            ))
-            await db.commit()
-
-        embed = discord.Embed(title="✅ 商品登録完了", color=0x9b59b6)
-        itype = "ロール" if item_type == "role" else "商品券"
-        dur   = f"{duration_days}日間" if duration_days > 0 else "永続" if item_type == "role" else "-"
-        embed.add_field(name="商品ID",   value=item_id,      inline=True)
-        embed.add_field(name="商品名",   value=name,         inline=True)
-        embed.add_field(name="価格",     value=f"{price:,} セスタ", inline=True)
-        embed.add_field(name="種別",     value=f"{itype} / {dur}", inline=True)
-        embed.add_field(
-            name="必要バッジ",
-            value=f"{BADGE_EMOJI.get(required_badge, '')} {required_badge}" if required_badge else "なし",
-            inline=True
-        )
-        if role:
-            embed.add_field(name="付与ロール", value=role.mention, inline=True)
-        embed.add_field(name="説明", value=description, inline=False)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    # ── /セスタショップ_商品削除 ───────────────────────────
-    @app_commands.command(name="セスタショップ_商品削除", description="【管理者】セスタショップから商品を削除します")
-    @app_commands.describe(item_id="削除する商品ID")
-    @has_permission("SUPREME_GOD")
-    async def shop_remove_item(self, interaction: discord.Interaction, item_id: str):
-        async with self.bot.get_db() as db:
-            async with db.execute(
-                "SELECT name FROM cesta_shop_items WHERE item_id = ?", (item_id,)
-            ) as c:
-                row = await c.fetchone()
-
-        if not row:
-            return await interaction.response.send_message(
-                "❌ 商品が見つかりません。", ephemeral=True
-            )
-
-        async with self.bot.get_db() as db:
-            await db.execute(
-                "DELETE FROM cesta_shop_items WHERE item_id = ?", (item_id,)
-            )
-            await db.commit()
-
-        await interaction.response.send_message(
-            f"🗑️ **{row['name']}**（{item_id}）を削除しました。", ephemeral=True
-        )
-
-    # ── /セスタショップ_商品一覧 ───────────────────────────
-    @app_commands.command(name="セスタショップ_商品一覧", description="【管理者】登録済み商品の一覧を確認します")
-    @has_permission("ADMIN")
-    async def shop_list_items(self, interaction: discord.Interaction):
-        async with self.bot.get_db() as db:
-            async with db.execute(
-                "SELECT * FROM cesta_shop_items ORDER BY required_badge ASC, price ASC"
-            ) as c:
-                items = await c.fetchall()
-
-        if not items:
-            return await interaction.response.send_message(
-                "📝 登録されている商品はありません。", ephemeral=True
-            )
-
-        embed = discord.Embed(title="📦 セスタショップ 商品一覧", color=0x9b59b6)
-        for item in items:
-            itype = "ロール" if item["item_type"] == "role" else "商品券"
-            dur   = f"{item['duration_days']}日" if item["duration_days"] > 0 else "永続" if item["item_type"] == "role" else "-"
-            rb    = f"{BADGE_EMOJI.get(item['required_badge'], '')} {item['required_badge']}" if item["required_badge"] else "なし"
-            embed.add_field(
-                name=f"`{item['item_id']}` {item['name']}",
-                value=(
-                    f"💜 {item['price']:,} セスタ　｜ {itype} / {dur}\n"
-                    f"必要バッジ: {rb}\n"
-                    f"{item['description']}"
-                ),
-                inline=False
-            )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    # ── /セスタショップ_ロール期限確認 ─────────────────────
-    @app_commands.command(name="セスタショップ_ロール期限確認", description="【管理者】期限付きロールの有効期限一覧を確認します")
-    @has_permission("ADMIN")
-    async def shop_check_subs(self, interaction: discord.Interaction):
-        async with self.bot.get_db() as db:
-            async with db.execute("""
-                SELECT s.user_id, s.item_id, s.expiry, i.name, i.role_id
-                FROM cesta_shop_subs s
-                JOIN cesta_shop_items i ON s.item_id = i.item_id
-                ORDER BY s.expiry ASC
-            """) as c:
-                subs = await c.fetchall()
-
-        if not subs:
-            return await interaction.response.send_message(
-                "📝 期限付きロールの購入者はいません。", ephemeral=True
-            )
-
-        now   = datetime.datetime.now()
-        embed = discord.Embed(title="⏰ 期限付きロール一覧", color=0x9b59b6)
-        for s in subs:
-            expiry  = datetime.datetime.fromisoformat(s["expiry"])
-            expired = expiry < now
-            user    = interaction.guild.get_member(s["user_id"])
-            uname   = user.display_name if user else f"ID:{s['user_id']}"
-            status  = "❌ 期限切れ" if expired else f"✅ {expiry.strftime('%Y/%m/%d')}"
-            embed.add_field(
-                name=f"{uname} / {s['name']}",
-                value=status,
-                inline=False
-            )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    # ── /セスタショップ_ロール期限切れ処理 ─────────────────
-    @app_commands.command(name="セスタショップ_期限切れ処理", description="【管理者】期限切れロールを一括で剥奪します")
-    @has_permission("SUPREME_GOD")
-    async def shop_expire_roles(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        now = datetime.datetime.now()
-
-        async with self.bot.get_db() as db:
-            async with db.execute("""
-                SELECT s.user_id, s.item_id, i.name, i.role_id
-                FROM cesta_shop_subs s
-                JOIN cesta_shop_items i ON s.item_id = i.item_id
-                WHERE s.expiry < ?
-            """, (now.isoformat(),)) as c:
-                expired = await c.fetchall()
-
-        if not expired:
-            return await interaction.followup.send(
-                "✅ 期限切れのロールはありません。", ephemeral=True
-            )
-
-        removed = []
-        errors  = []
-        async with self.bot.get_db() as db:
-            for e in expired:
-                user = interaction.guild.get_member(e["user_id"])
-                if user and e["role_id"]:
-                    role = interaction.guild.get_role(int(e["role_id"]))
-                    if role:
-                        try:
-                            await user.remove_roles(role, reason="セスタショップ期限切れ")
-                            removed.append(f"{user.display_name} / {e['name']}")
-                        except Exception as ex:
-                            errors.append(f"{e['user_id']}: {ex}")
-
-                await db.execute(
-                    "DELETE FROM cesta_shop_subs WHERE user_id = ? AND item_id = ?",
-                    (e["user_id"], e["item_id"])
-                )
-            await db.commit()
-
-        lines = "\n".join(f"🗑️ {r}" for r in removed) or "なし"
-        embed = discord.Embed(title="🗑️ 期限切れ処理完了", color=0x9b59b6)
-        embed.add_field(name=f"剥奪({len(removed)}件)", value=lines, inline=False)
-        if errors:
-            embed.add_field(name="エラー", value="\n".join(errors), inline=False)
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-    # ── /セスタショップ_チケット使用 ──────────────────────
-    @app_commands.command(name="セスタショップ_チケット使用", description="【管理者】ユーザーの商品券を使用済みにします")
-    @app_commands.describe(ticket_id="チケットID（/セスタチケット確認 で確認）", user="対象ユーザー")
-    @has_permission("ADMIN")
-    async def shop_use_ticket(
-        self, interaction: discord.Interaction,
-        user: discord.Member, ticket_id: int
-    ):
-        now = datetime.datetime.now()
-        async with self.bot.get_db() as db:
-            async with db.execute(
-                "SELECT * FROM cesta_tickets WHERE id = ? AND user_id = ? AND used_at IS NULL",
-                (ticket_id, user.id)
-            ) as c:
-                ticket = await c.fetchone()
-
-            if not ticket:
-                return await interaction.response.send_message(
-                    "❌ チケットが見つからないか、すでに使用済みです。", ephemeral=True
-                )
-
-            await db.execute(
-                "UPDATE cesta_tickets SET used_at = ?, used_by = ? WHERE id = ?",
-                (now.isoformat(), interaction.user.id, ticket_id)
-            )
-            await db.commit()
-
-        await interaction.response.send_message(
-            f"✅ {user.mention} の **{ticket['item_name']}**（#{ticket_id}）を使用済みにしました。",
-            ephemeral=True
-        )
 
 # --- 本体 (Cog) ---
 class HumanStockMarket(commands.Cog):
