@@ -222,7 +222,6 @@ class BankDatabase:
             )
         """)
 
-        await conn.execute("DROP TABLE IF EXISTS daily_stats")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS daily_stats (
                 date          TEXT PRIMARY KEY,
