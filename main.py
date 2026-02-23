@@ -1,5 +1,4 @@
 import discord
-# import keep_alive # 必要な場合はコメントアウトを外してください
 import matplotlib
 matplotlib.use('Agg') # サーバー上でグラフを描くための設定
 import matplotlib.pyplot as plt
