@@ -230,6 +230,14 @@ class BankDatabase:
                 gini          REAL    DEFAULT 0
             )
         """)
+        for col, col_type in [("total_stell", "INTEGER DEFAULT 0"),
+                               ("total_cesta", "INTEGER DEFAULT 0"),
+                               ("gini", "REAL DEFAULT 0")]:
+            try:
+                await conn.execute(f"ALTER TABLE daily_stats ADD COLUMN {col} {col_type}")
+            except Exception:
+                pass  # カラムが既に存在する場合は無視
+                
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS stock_issuers (
                 user_id INTEGER PRIMARY KEY,
