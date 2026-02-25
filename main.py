@@ -2776,6 +2776,117 @@ class Blackjack(commands.Cog):
         embed = view._embed()
         embed.set_footer(text=f"セスタ「{c_line_bj('deal')}」")
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+# ── Grand Opening カウントダウン ──
+OPEN_AT = datetime.datetime(2026, 2, 26, 0, 0, 0,
+                             tzinfo=datetime.timezone(datetime.timedelta(hours=9)))
+
+def build_countdown_embed(now: datetime.datetime) -> discord.Embed:
+    diff = OPEN_AT - now
+    if diff.total_seconds() <= 0:
+        embed = discord.Embed(
+            description=(
+                "```\n"
+                "  ✦  STELLA  ✦\n\n"
+                "   ─── GRAND OPEN ───\n\n"
+                "  The stage is now yours.\n"
+                "```"
+            ),
+            color=0xc9a96e
+        )
+        embed.set_footer(text="STELLA — 2026.02.26 00:00 OPEN")
+        return embed
+
+    total_sec = int(diff.total_seconds())
+    h = total_sec // 3600
+    m = (total_sec % 3600) // 60
+    s = total_sec % 60
+    bar_len = 20
+    filled = int((1 - diff.total_seconds() / (24 * 3600)) * bar_len)
+    filled = max(0, min(bar_len, filled))
+    bar = "█" * filled + "░" * (bar_len - filled)
+    embed = discord.Embed(
+        description=(
+            "```\n"
+            "  ✦  STELLA  ✦\n\n"
+            "   ─── GRAND OPENING ───\n\n"
+            f"   {h:02d}h  {m:02d}m  {s:02d}s\n\n"
+            f"   [{bar}]\n"
+            "```"
+        ),
+        color=0x3a2a1a
+    )
+    open_ts = int(OPEN_AT.timestamp())
+    embed.set_footer(text=f"STELLA — Pre-Open  |  <t:{open_ts}:F> OPEN")
+    return embed
+
+
+class Countdown(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self._panels: dict[int, int] = {}
+        self._opened = False
+
+    def cog_load(self):
+        self.update_loop.start()
+
+    def cog_unload(self):
+        self.update_loop.cancel()
+
+    @tasks.loop(seconds=60)
+    async def update_loop(self):
+        if not self._panels:
+            return
+        now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+        embed = build_countdown_embed(now)
+        dead = []
+        for msg_id, ch_id in self._panels.items():
+            ch = self.bot.get_channel(ch_id)
+            if ch is None:
+                dead.append(msg_id)
+                continue
+            try:
+                msg = await ch.fetch_message(msg_id)
+                await msg.edit(embed=embed)
+            except discord.NotFound:
+                dead.append(msg_id)
+            except Exception:
+                pass
+        for d in dead:
+            del self._panels[d]
+        if (OPEN_AT - now).total_seconds() <= 0 and not self._opened:
+            self._opened = True
+            self.update_loop.stop()
+
+    @update_loop.before_loop
+    async def before_loop(self):
+        await self.bot.wait_until_ready()
+
+    @app_commands.command(name="countdown_panel", description="Grand Openingカウントダウンパネルを投稿")
+    @app_commands.default_permissions(administrator=True)
+    async def countdown_panel(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+        msg = await interaction.channel.send(embed=build_countdown_embed(now))
+        self._panels[msg.id] = interaction.channel.id
+        await interaction.followup.send("✅ カウントダウンパネルを投稿しました。1分ごと自動更新されます。", ephemeral=True)
+
+    @app_commands.command(name="countdown_clear", description="カウントダウンパネルを削除")
+    @app_commands.default_permissions(administrator=True)
+    async def countdown_clear(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        count = 0
+        for msg_id, ch_id in list(self._panels.items()):
+            ch = self.bot.get_channel(ch_id)
+            if ch:
+                try:
+                    msg = await ch.fetch_message(msg_id)
+                    await msg.delete()
+                    count += 1
+                except Exception:
+                    pass
+        self._panels.clear()
+        await interaction.followup.send(f"🗑️ {count}件のパネルを削除しました。", ephemeral=True)
     
 
 
@@ -5671,6 +5782,7 @@ class CestaBankBot(commands.Bot):
         await self.add_cog(CestaShop(self))
         await self.add_cog(Chinchiro(self))
         await self.add_cog(Blackjack(self))
+        await self.add_cog(Countdown(self))
         
         if not self.backup_db_task.is_running():
             self.backup_db_task.start()
