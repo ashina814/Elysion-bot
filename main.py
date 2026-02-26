@@ -365,6 +365,26 @@ class BankDatabase:
         await conn.execute("INSERT OR IGNORE INTO cesta_badge_thresholds VALUES ('道化師の証', 500)")
         await conn.execute("INSERT OR IGNORE INTO cesta_badge_thresholds VALUES ('座長の印', 2000)")
 
+        await conn.execute("""CREATE TABLE IF NOT EXISTS ticket_config (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )""")
+        await conn.execute("""CREATE TABLE IF NOT EXISTS ticket_types (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE,
+            emoji TEXT,
+            description TEXT
+        )""")
+        await conn.execute("""CREATE TABLE IF NOT EXISTS tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id INTEGER UNIQUE,
+            user_id INTEGER,
+            type_name TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            closed_at DATETIME,
+            closed_by INTEGER
+        )""")
+        
         await conn.commit()
 
 
@@ -527,7 +547,127 @@ class PlanSelect(discord.ui.Select):
                 await db.commit()
             await interaction.followup.send("❌ VC作成中にエラーが発生しました。料金を返金しました。", ephemeral=True)
 
+class PublicPlanSelect(discord.ui.Select):
+    def __init__(self, prices: dict):
+        self.prices = prices
+        options = [
+            discord.SelectOption(label="6時間プラン",  description=f"{prices.get('6',  10000):,} Stell", value="6",  emoji="🕐"),
+            discord.SelectOption(label="12時間プラン", description=f"{prices.get('12', 30000):,} Stell", value="12", emoji="🕓"),
+            discord.SelectOption(label="24時間プラン", description=f"{prices.get('24', 50000):,} Stell", value="24", emoji="🕛"),
+        ]
+        super().__init__(placeholder="利用プランを選択してください...", min_values=1, max_values=1, options=options, row=0)
 
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        user = interaction.user
+        bot  = interaction.client
+        hours = int(self.values[0])
+        price = self.prices.get(str(hours), 10000)
+
+        # 既存VCチェック（プライベート版と共通）
+        async with bot.get_db() as db:
+            async with db.execute("SELECT channel_id FROM temp_vcs WHERE owner_id = ?", (user.id,)) as cursor:
+                existing = await cursor.fetchone()
+            if existing:
+                real_channel = bot.get_channel(existing['channel_id'])
+                if real_channel is None:
+                    await db.execute("DELETE FROM temp_vcs WHERE owner_id = ?", (user.id,))
+                    await db.commit()
+                else:
+                    return await interaction.followup.send("❌ あなたは既に一時VCを作成しています。", ephemeral=True)
+
+        # 残高チェック
+        async with bot.get_db() as db:
+            async with db.execute("SELECT balance FROM accounts WHERE user_id = ?", (user.id,)) as cursor:
+                row = await cursor.fetchone()
+                current_bal = row['balance'] if row else 0
+            if current_bal < price:
+                return await interaction.followup.send(
+                    f"❌ 残高不足です。\n必要: {price:,} Stell / 所持: {current_bal:,} Stell", ephemeral=True
+                )
+
+            # 除外ロールを取得
+            async with db.execute("SELECT value FROM server_config WHERE key = 'public_vc_exclude_roles'") as c:
+                row = await c.fetchone()
+            exclude_ids = [int(x) for x in row['value'].split(',') if x] if row and row['value'] else []
+
+            month_tag = datetime.datetime.now().strftime("%Y-%m")
+            await db.execute("UPDATE accounts SET balance = balance - ? WHERE user_id = ?", (price, user.id))
+            await db.execute(
+                "INSERT INTO transactions (sender_id, receiver_id, amount, type, description, month_tag) VALUES (?, 0, ?, 'PUBLIC_VC_CREATE', ?, ?)",
+                (user.id, price, f"公開VC作成 ({hours}時間)", month_tag)
+            )
+            await db.commit()
+
+        try:
+            guild    = interaction.guild
+            category = interaction.channel.category
+
+            # 除外ロールは拒否、それ以外は全員OK
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True),
+                guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True),
+                user: discord.PermissionOverwrite(
+                    view_channel=True, connect=True, speak=True, stream=True,
+                    use_voice_activation=True, send_messages=True, read_message_history=True,
+                    move_members=True, mute_members=True
+                ),
+            }
+            for role_id in exclude_ids:
+                role = guild.get_role(role_id)
+                if role:
+                    overwrites[role] = discord.PermissionOverwrite(view_channel=False, connect=False)
+
+            channel_name = f"🔓 {user.display_name}の部屋"
+            if not category:
+                new_vc = await guild.create_voice_channel(name=channel_name, overwrites=overwrites)
+            else:
+                new_vc = await guild.create_voice_channel(name=channel_name, category=category, overwrites=overwrites)
+
+            expire_dt = datetime.datetime.now() + datetime.timedelta(hours=hours)
+            async with bot.get_db() as db:
+                await db.execute(
+                    "INSERT INTO temp_vcs (channel_id, guild_id, owner_id, expire_at) VALUES (?, ?, ?, ?)",
+                    (new_vc.id, guild.id, user.id, expire_dt)
+                )
+                await db.commit()
+
+            await interaction.followup.send(
+                f"✅ 公開VC作成完了: {new_vc.mention}\n期限: {expire_dt.strftime('%m/%d %H:%M')}",
+                ephemeral=True
+            )
+
+        except Exception as e:
+            logger.error(f"Public VC Create Error: {e}")
+            async with bot.get_db() as db:
+                await db.execute("UPDATE accounts SET balance = balance + ? WHERE user_id = ?", (price, user.id))
+                await db.commit()
+            await interaction.followup.send("❌ VC作成中にエラーが発生しました。料金を返金しました。", ephemeral=True)
+
+
+class PublicVCPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="公開VCを作成する", style=discord.ButtonStyle.primary, custom_id="create_public_vc_btn", emoji="🔓")
+    async def create_vc_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        bot = interaction.client
+        prices = {}
+        async with bot.get_db() as db:
+            async with db.execute("SELECT key, value FROM server_config WHERE key IN ('public_vc_price_6', 'public_vc_price_12', 'public_vc_price_24')") as cursor:
+                rows = await cursor.fetchall()
+                for row in rows:
+                    prices[row['key'].replace('public_vc_price_', '')] = int(row['value'])
+
+        if '6'  not in prices: prices['6']  = 10000
+        if '12' not in prices: prices['12'] = 30000
+        if '24' not in prices: prices['24'] = 50000
+
+        view = discord.ui.View()
+        view.add_item(PublicPlanSelect(prices))
+        await interaction.response.send_message("利用する時間プランを選択してください。", view=view, ephemeral=True)
+        
 class VCPanel(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -640,6 +780,96 @@ class PrivateVCManager(commands.Cog):
 
         await interaction.channel.send(embed=embed, view=VCPanel())
         await interaction.followup.send("✅ 設定を保存し、パネルを設置しました。", ephemeral=True)
+
+# --- 公開VC用: 除外ロール設定 ---
+    @app_commands.command(name="公開vc除外ロール設定", description="【管理者】公開VCに入れないロールを設定します")
+    @app_commands.describe(action="追加か削除か", role="対象ロール")
+    @app_commands.choices(action=[
+        app_commands.Choice(name="追加", value="add"),
+        app_commands.Choice(name="削除", value="remove"),
+        app_commands.Choice(name="一覧確認", value="list"),
+    ])
+    @has_permission("ADMIN")
+    async def config_public_vc_exclude(self, interaction: discord.Interaction, action: str, role: Optional[discord.Role] = None):
+        await interaction.response.defer(ephemeral=True)
+
+        async with self.bot.get_db() as db:
+            async with db.execute("SELECT value FROM server_config WHERE key = 'public_vc_exclude_roles'") as c:
+                row = await c.fetchone()
+            current = row['value'].split(',') if row and row['value'] else []
+
+        if action == "list":
+            if not current:
+                return await interaction.followup.send("除外ロールは設定されていません。", ephemeral=True)
+            mentions = "\n".join(f"<@&{r}>" for r in current if r)
+            embed = discord.Embed(title="🚫 公開VC除外ロール一覧", description=mentions, color=0xff4444)
+            return await interaction.followup.send(embed=embed, ephemeral=True)
+
+        if not role:
+            return await interaction.followup.send("❌ ロールを指定してください。", ephemeral=True)
+
+        if action == "add":
+            if str(role.id) in current:
+                return await interaction.followup.send(f"⚠️ {role.mention} は既に登録されています。", ephemeral=True)
+            current.append(str(role.id))
+            msg = f"✅ {role.mention} を除外ロールに追加しました。"
+        else:
+            if str(role.id) not in current:
+                return await interaction.followup.send(f"⚠️ {role.mention} は登録されていません。", ephemeral=True)
+            current.remove(str(role.id))
+            msg = f"🗑️ {role.mention} を除外ロールから削除しました。"
+
+        async with self.bot.get_db() as db:
+            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES ('public_vc_exclude_roles', ?)", (','.join(current),))
+            await db.commit()
+
+        await interaction.followup.send(msg, ephemeral=True)
+
+    # --- 公開VC用: パネル設置 ---
+    @app_commands.command(name="公開vcパネル作成", description="公開一時VCの作成パネルを設置します")
+    @app_commands.describe(
+        title="パネルのタイトル",
+        description="パネルの説明文（\\nで改行）",
+        price_6h="6時間プランの価格",
+        price_12h="12時間プランの価格",
+        price_24h="24時間プランの価格"
+    )
+    @has_permission("ADMIN")
+    async def deploy_public_panel(
+        self,
+        interaction: discord.Interaction,
+        title: str = "公開ルーム",
+        description: str = None,
+        price_6h: int = 10000,
+        price_12h: int = 30000,
+        price_24h: int = 50000
+    ):
+        await interaction.response.defer(ephemeral=True)
+
+        if description is None:
+            description = (
+                "誰でも入れる公開一時VCを作成できます。\n\n"
+                "**🔓 公開ルーム**\n設定された一部のロールを除き誰でも参加できます\n"
+                "**🛡 料金システム**\n作成時に自動引き落とし\n"
+                f"**⏰ 料金プラン**\n"
+                f"• **6時間**: {price_6h:,} Stell\n"
+                f"• **12時間**: {price_12h:,} Stell\n"
+                f"• **24時間**: {price_24h:,} Stell"
+            )
+        else:
+            description = description.replace("\\n", "\n")
+
+        async with self.bot.get_db() as db:
+            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES ('public_vc_price_6', ?)",  (str(price_6h),))
+            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES ('public_vc_price_12', ?)", (str(price_12h),))
+            await db.execute("INSERT OR REPLACE INTO server_config (key, value) VALUES ('public_vc_price_24', ?)", (str(price_24h),))
+            await db.commit()
+
+        embed = discord.Embed(title=title, description=description, color=0x2b2d31)
+        embed.set_footer(text=f"Last Updated: {datetime.datetime.now().strftime('%Y/%m/%d %H:%M')}")
+
+        await interaction.channel.send(embed=embed, view=PublicVCPanel())
+        await interaction.followup.send("✅ 設定を保存し、公開VCパネルを設置しました。", ephemeral=True)
 
 
 
@@ -5274,6 +5504,7 @@ class AdminTools(commands.Cog):
         discord.app_commands.Choice(name="通貨ログ (送金など)", value="currency_log_id"),
         discord.app_commands.Choice(name="給与ログ (一斉支給)", value="salary_log_id"),
         discord.app_commands.Choice(name="面接ログ (合格通知)", value="interview_log_id")
+        discord.app_commands.Choice(name="削除ログ (メッセージ削除)", value="delete_log_id")
     ])
     @has_permission("SUPREME_GOD")
     async def config_log_channel(self, interaction: discord.Interaction, log_type: str, channel: discord.TextChannel):
@@ -5347,6 +5578,53 @@ class AdminTools(commands.Cog):
         embed = discord.Embed(title="🎙 報酬対象VC一覧", description=channels_text, color=discord.Color.green())
         await interaction.followup.send(embed=embed, ephemeral=True)
 
+    @commands.Cog.listener()
+    async def on_message_delete(self, message: discord.Message):
+        # Bot自身のメッセージ・DMは無視
+        if message.author.bot:
+            return
+        if not message.guild:
+            return
+
+        log_ch_id = None
+        async with self.bot.get_db() as db:
+            async with db.execute("SELECT value FROM server_config WHERE key = 'delete_log_id'") as c:
+                row = await c.fetchone()
+                if row:
+                    log_ch_id = int(row['value'])
+
+        if not log_ch_id:
+            return
+
+        channel = self.bot.get_channel(log_ch_id)
+        if not channel:
+            return
+
+        embed = discord.Embed(
+            title="🗑️ メッセージ削除ログ",
+            color=0xff4444,
+            timestamp=datetime.datetime.now()
+        )
+        embed.add_field(name="送信者", value=message.author.mention, inline=True)
+        embed.add_field(name="チャンネル", value=message.channel.mention, inline=True)
+
+        content = message.content or "*(テキストなし)*"
+        if len(content) > 1000:
+            content = content[:1000] + "…"
+        embed.add_field(name="内容", value=content, inline=False)
+
+        if message.attachments:
+            att_list = "\n".join(a.filename for a in message.attachments)
+            embed.add_field(name=f"添付ファイル ({len(message.attachments)}件)", value=att_list, inline=False)
+
+        embed.set_footer(text=f"メッセージID: {message.id} | ユーザーID: {message.author.id}")
+        embed.set_thumbnail(url=message.author.display_avatar.url)
+
+        try:
+            await channel.send(embed=embed)
+        except Exception as e:
+            logger.error(f"Delete Log Send Error: {e}")
+
 
     @app_commands.command(name="ギャンブル制限解除", description="【管理者】指定ユーザーまたはロールの今日のプレイ制限を解除します")
     @app_commands.describe(
@@ -5395,6 +5673,405 @@ class AdminTools(commands.Cog):
             msg = f"✅ {role.mention} ({len(members)}名) の **{game_str}** の本日の制限を解除しました。"
 
         await interaction.followup.send(msg, ephemeral=True)
+
+# ================================================================
+#  UI: チケット作成パネル
+# ================================================================
+
+class TicketTypeSelect(discord.ui.Select):
+    def __init__(self, bot, types: list):
+        self.bot = bot
+        options = [
+            discord.SelectOption(
+                label=t['name'],
+                description=t['description'] or "",
+                emoji=t['emoji'] or "🎫",
+                value=str(t['id'])
+            )
+            for t in types
+        ]
+        super().__init__(
+            placeholder="チケットの種類を選んでください...",
+            min_values=1, max_values=1,
+            options=options,
+            custom_id="ticket_type_select"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        bot = interaction.client
+        user = interaction.user
+        guild = interaction.guild
+
+        # 選択した種類を取得
+        type_id = int(self.values[0])
+        async with bot.get_db() as db:
+            async with db.execute("SELECT * FROM ticket_types WHERE id = ?", (type_id,)) as c:
+                t = await c.fetchone()
+            if not t:
+                return await interaction.followup.send("❌ チケット種類が見つかりません。", ephemeral=True)
+
+            # 設定取得
+            async with db.execute("SELECT key, value FROM ticket_config") as c:
+                rows = await c.fetchall()
+            cfg = {r['key']: r['value'] for r in rows}
+
+        category_id   = int(cfg['category_id'])   if 'category_id'   in cfg else None
+        support_role_id = int(cfg['support_role_id']) if 'support_role_id' in cfg else None
+        log_ch_id     = int(cfg['log_channel_id']) if 'log_channel_id' in cfg else None
+
+        # 対応ロール
+        support_role = guild.get_role(support_role_id) if support_role_id else None
+        category     = guild.get_channel(category_id)  if category_id    else None
+
+        # 既存チケットチェック（同じユーザーが開いているチケットが既にあるか）
+        async with bot.get_db() as db:
+            async with db.execute(
+                "SELECT channel_id FROM tickets WHERE user_id = ? AND closed_at IS NULL", (user.id,)
+            ) as c:
+                existing = await c.fetchone()
+        if existing:
+            ch = guild.get_channel(existing['channel_id'])
+            if ch:
+                return await interaction.followup.send(
+                    f"❌ 既にチケットが開いています: {ch.mention}", ephemeral=True
+                )
+
+        # チャンネル作成
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.me:           discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
+            user:               discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        }
+        if support_role:
+            overwrites[support_role] = discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True, manage_messages=True
+            )
+
+        emoji = t['emoji'] or "🎫"
+        channel_name = f"{emoji}│{user.display_name}"
+
+        try:
+            if category:
+                ch = await guild.create_text_channel(channel_name, category=category, overwrites=overwrites)
+            else:
+                ch = await guild.create_text_channel(channel_name, overwrites=overwrites)
+        except Exception as e:
+            logger.error(f"Ticket channel create error: {e}")
+            return await interaction.followup.send("❌ チャンネル作成に失敗しました。", ephemeral=True)
+
+        # DBに登録
+        async with bot.get_db() as db:
+            await db.execute(
+                "INSERT INTO tickets (channel_id, user_id, type_name) VALUES (?, ?, ?)",
+                (ch.id, user.id, t['name'])
+            )
+            await db.commit()
+
+        # チャンネル内にパネル送信
+        embed = discord.Embed(
+            title=f"{emoji} {t['name']}",
+            description=(
+                f"{user.mention} のチケットです。\n\n"
+                f"担当: {support_role.mention if support_role else '管理者'}\n\n"
+                f"お問い合わせ内容をこのチャンネルに入力してください。\n"
+                f"解決したら下の **クローズ** ボタンを押してください。"
+            ),
+            color=0x5865F2,
+            timestamp=datetime.datetime.now()
+        )
+        embed.set_footer(text=f"チケットID: {ch.id}")
+
+        await ch.send(
+            content=f"{user.mention}" + (f" {support_role.mention}" if support_role else ""),
+            embed=embed,
+            view=TicketCloseView(bot)
+        )
+
+        await interaction.followup.send(f"✅ チケットを作成しました: {ch.mention}", ephemeral=True)
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self, bot, types: list):
+        super().__init__(timeout=None)
+        self.add_item(TicketTypeSelect(bot, types))
+
+
+class TicketCloseView(discord.ui.View):
+    def __init__(self, bot=None):
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    @discord.ui.button(label="クローズ", style=discord.ButtonStyle.danger, emoji="🔒", custom_id="ticket_close_btn")
+    async def close_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        bot = interaction.client
+        guild = interaction.guild
+        ch = interaction.channel
+
+        # DBからチケット情報取得
+        async with bot.get_db() as db:
+            async with db.execute("SELECT * FROM tickets WHERE channel_id = ?", (ch.id,)) as c:
+                ticket = await c.fetchone()
+        if not ticket:
+            return await interaction.followup.send("❌ このチャンネルはチケットではありません。", ephemeral=True)
+
+        # 権限チェック（作成者 or 対応ロール or 管理者）
+        async with bot.get_db() as db:
+            async with db.execute("SELECT value FROM ticket_config WHERE key = 'support_role_id'") as c:
+                row = await c.fetchone()
+        support_role_id = int(row['value']) if row else None
+        support_role    = guild.get_role(support_role_id) if support_role_id else None
+
+        is_owner   = interaction.user.id == ticket['user_id']
+        is_support = support_role and support_role in interaction.user.roles
+        is_admin   = await bot.is_owner(interaction.user) or any(
+            r.id in bot.config.admin_roles for r in interaction.user.roles
+        )
+
+        if not (is_owner or is_support or is_admin):
+            return await interaction.followup.send("❌ クローズする権限がありません。", ephemeral=True)
+
+        # ログ生成
+        log_lines = [
+            f"=== チケットログ ===",
+            f"チケットID : {ch.id}",
+            f"種類       : {ticket['type_name']}",
+            f"作成者     : {ticket['user_id']}",
+            f"作成日時   : {ticket['created_at']}",
+            f"クローズ者 : {interaction.user} ({interaction.user.id})",
+            f"クローズ日 : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "=" * 40,
+            ""
+        ]
+
+        async for message in ch.history(limit=None, oldest_first=True):
+            ts   = message.created_at.strftime("%Y-%m-%d %H:%M:%S")
+            name = f"{message.author.display_name} ({message.author.id})"
+            content = message.content or ""
+            attachments = " ".join(a.url for a in message.attachments)
+            line = f"[{ts}] {name}: {content}"
+            if attachments:
+                line += f"\n  📎 {attachments}"
+            log_lines.append(line)
+
+        log_text = "\n".join(log_lines)
+        log_bytes = log_text.encode("utf-8")
+        log_file  = discord.File(
+            fp=__import__("io").BytesIO(log_bytes),
+            filename=f"ticket_{ch.id}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        )
+
+        # DBを更新
+        async with bot.get_db() as db:
+            await db.execute(
+                "UPDATE tickets SET closed_at = ?, closed_by = ? WHERE channel_id = ?",
+                (datetime.datetime.now().isoformat(), interaction.user.id, ch.id)
+            )
+            await db.commit()
+
+        # ログチャンネルに送信
+        async with bot.get_db() as db:
+            async with db.execute("SELECT value FROM ticket_config WHERE key = 'log_channel_id'") as c:
+                row = await c.fetchone()
+        log_ch_id = int(row['value']) if row else None
+
+        if log_ch_id:
+            log_ch = bot.get_channel(log_ch_id)
+            if log_ch:
+                creator = guild.get_member(ticket['user_id'])
+                embed = discord.Embed(
+                    title="🔒 チケットクローズ",
+                    color=0xff4444,
+                    timestamp=datetime.datetime.now()
+                )
+                embed.add_field(name="種類",     value=ticket['type_name'],                              inline=True)
+                embed.add_field(name="作成者",   value=f"<@{ticket['user_id']}>",                       inline=True)
+                embed.add_field(name="クローズ", value=interaction.user.mention,                         inline=True)
+                embed.add_field(name="作成日時", value=str(ticket['created_at'])[:16],                  inline=True)
+                await log_ch.send(embed=embed, file=log_file)
+
+        # チャンネル削除
+        try:
+            await ch.delete(reason=f"チケットクローズ by {interaction.user}")
+        except Exception as e:
+            logger.error(f"Ticket channel delete error: {e}")
+
+
+# ================================================================
+#  Cog: TicketSystem
+# ================================================================
+
+class TicketSystem(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    # ── 設定コマンド群 ────────────────────────────────────
+
+    @app_commands.command(name="チケット_カテゴリ設定", description="【管理者】チケットチャンネルを作るカテゴリを設定します")
+    @has_permission("ADMIN")
+    async def config_category(self, interaction: discord.Interaction, category: discord.CategoryChannel):
+        async with self.bot.get_db() as db:
+            await db.execute("INSERT OR REPLACE INTO ticket_config (key, value) VALUES ('category_id', ?)", (str(category.id),))
+            await db.commit()
+        await interaction.response.send_message(f"✅ カテゴリを **{category.name}** に設定しました。", ephemeral=True)
+
+    @app_commands.command(name="チケット_対応ロール設定", description="【管理者】チケットに対応するロールを設定します")
+    @has_permission("ADMIN")
+    async def config_support_role(self, interaction: discord.Interaction, role: discord.Role):
+        async with self.bot.get_db() as db:
+            await db.execute("INSERT OR REPLACE INTO ticket_config (key, value) VALUES ('support_role_id', ?)", (str(role.id),))
+            await db.commit()
+        await interaction.response.send_message(f"✅ 対応ロールを {role.mention} に設定しました。", ephemeral=True)
+
+    @app_commands.command(name="チケット_ログチャンネル設定", description="【管理者】クローズ時のログを送るチャンネルを設定します")
+    @has_permission("ADMIN")
+    async def config_log_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        async with self.bot.get_db() as db:
+            await db.execute("INSERT OR REPLACE INTO ticket_config (key, value) VALUES ('log_channel_id', ?)", (str(channel.id),))
+            await db.commit()
+        await interaction.response.send_message(f"✅ ログチャンネルを {channel.mention} に設定しました。", ephemeral=True)
+
+    @app_commands.command(name="チケット_種類追加", description="【管理者】チケットの種類を追加します")
+    @app_commands.describe(name="種類名（例: 問い合わせ）", emoji="絵文字", description="説明文")
+    @has_permission("ADMIN")
+    async def add_ticket_type(self, interaction: discord.Interaction, name: str, emoji: str = "🎫", description: str = ""):
+        async with self.bot.get_db() as db:
+            try:
+                await db.execute(
+                    "INSERT INTO ticket_types (name, emoji, description) VALUES (?, ?, ?)",
+                    (name, emoji, description)
+                )
+                await db.commit()
+            except Exception:
+                return await interaction.response.send_message(f"⚠️ **{name}** は既に登録されています。", ephemeral=True)
+        await interaction.response.send_message(f"✅ チケット種類 {emoji} **{name}** を追加しました。", ephemeral=True)
+
+    @app_commands.command(name="チケット_種類削除", description="【管理者】チケットの種類を削除します")
+    @app_commands.describe(name="削除する種類名")
+    @has_permission("ADMIN")
+    async def remove_ticket_type(self, interaction: discord.Interaction, name: str):
+        async with self.bot.get_db() as db:
+            async with db.execute("SELECT id FROM ticket_types WHERE name = ?", (name,)) as c:
+                row = await c.fetchone()
+            if not row:
+                return await interaction.response.send_message(f"❌ **{name}** が見つかりません。", ephemeral=True)
+            await db.execute("DELETE FROM ticket_types WHERE name = ?", (name,))
+            await db.commit()
+        await interaction.response.send_message(f"🗑️ チケット種類 **{name}** を削除しました。", ephemeral=True)
+
+    @app_commands.command(name="チケット_種類一覧", description="【管理者】登録されているチケット種類を確認します")
+    @has_permission("ADMIN")
+    async def list_ticket_types(self, interaction: discord.Interaction):
+        async with self.bot.get_db() as db:
+            async with db.execute("SELECT * FROM ticket_types ORDER BY id") as c:
+                types = await c.fetchall()
+        if not types:
+            return await interaction.response.send_message("📝 チケット種類が登録されていません。", ephemeral=True)
+        embed = discord.Embed(title="🎫 チケット種類一覧", color=0x5865F2)
+        for t in types:
+            embed.add_field(
+                name=f"{t['emoji']} {t['name']}",
+                value=t['description'] or "説明なし",
+                inline=False
+            )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="チケット_パネル設置", description="【管理者】チケット作成パネルを設置します")
+    @app_commands.describe(title="パネルタイトル", description="パネル説明文")
+    @has_permission("ADMIN")
+    async def deploy_ticket_panel(
+        self,
+        interaction: discord.Interaction,
+        title: str = "🎫 サポートチケット",
+        description: str = "お問い合わせ・ご報告はチケットからお願いします。\n下のメニューから種類を選んでチケットを開いてください。"
+    ):
+        await interaction.response.defer(ephemeral=True)
+
+        async with self.bot.get_db() as db:
+            async with db.execute("SELECT * FROM ticket_types ORDER BY id") as c:
+                types = await c.fetchall()
+
+        if not types:
+            return await interaction.followup.send("❌ チケット種類が1つも登録されていません。先に /チケット_種類追加 で登録してください。", ephemeral=True)
+
+        embed = discord.Embed(title=title, description=description, color=0x5865F2)
+        embed.set_footer(text=f"Last Updated: {datetime.datetime.now().strftime('%Y/%m/%d %H:%M')}")
+
+        await interaction.channel.send(embed=embed, view=TicketPanelView(self.bot, [dict(t) for t in types]))
+        await interaction.followup.send("✅ チケットパネルを設置しました。", ephemeral=True)
+
+    @app_commands.command(name="チケット_強制クローズ", description="【管理者】指定チャンネルのチケットを強制クローズします")
+    @app_commands.describe(channel="クローズするチケットチャンネル")
+    @has_permission("ADMIN")
+    async def force_close_ticket(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        async with self.bot.get_db() as db:
+            async with db.execute("SELECT * FROM tickets WHERE channel_id = ? AND closed_at IS NULL", (channel.id,)) as c:
+                ticket = await c.fetchone()
+        if not ticket:
+            return await interaction.response.send_message("❌ 指定チャンネルにオープン中のチケットが見つかりません。", ephemeral=True)
+
+        # TicketCloseViewのclose処理を流用
+        view = TicketCloseView(self.bot)
+        # interactionをチャンネルに差し替えて処理するため、直接処理を書く
+        await interaction.response.defer(ephemeral=True)
+
+        log_lines = [
+            f"=== チケットログ (強制クローズ) ===",
+            f"チケットID : {channel.id}",
+            f"種類       : {ticket['type_name']}",
+            f"作成者     : {ticket['user_id']}",
+            f"作成日時   : {ticket['created_at']}",
+            f"クローズ者 : {interaction.user} ({interaction.user.id})",
+            f"クローズ日 : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "=" * 40,
+            ""
+        ]
+        async for message in channel.history(limit=None, oldest_first=True):
+            ts      = message.created_at.strftime("%Y-%m-%d %H:%M:%S")
+            name    = f"{message.author.display_name} ({message.author.id})"
+            content = message.content or ""
+            attachments = " ".join(a.url for a in message.attachments)
+            line = f"[{ts}] {name}: {content}"
+            if attachments:
+                line += f"\n  📎 {attachments}"
+            log_lines.append(line)
+
+        log_text  = "\n".join(log_lines)
+        log_bytes = log_text.encode("utf-8")
+        log_file  = discord.File(
+            fp=__import__("io").BytesIO(log_bytes),
+            filename=f"ticket_{channel.id}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        )
+
+        async with self.bot.get_db() as db:
+            await db.execute(
+                "UPDATE tickets SET closed_at = ?, closed_by = ? WHERE channel_id = ?",
+                (datetime.datetime.now().isoformat(), interaction.user.id, channel.id)
+            )
+            await db.commit()
+
+        async with self.bot.get_db() as db:
+            async with db.execute("SELECT value FROM ticket_config WHERE key = 'log_channel_id'") as c:
+                row = await c.fetchone()
+        log_ch_id = int(row['value']) if row else None
+
+        if log_ch_id:
+            log_ch = self.bot.get_channel(log_ch_id)
+            if log_ch:
+                embed = discord.Embed(title="🔒 チケットクローズ（強制）", color=0xff4444, timestamp=datetime.datetime.now())
+                embed.add_field(name="種類",     value=ticket['type_name'],       inline=True)
+                embed.add_field(name="作成者",   value=f"<@{ticket['user_id']}>", inline=True)
+                embed.add_field(name="クローズ", value=interaction.user.mention,  inline=True)
+                await log_ch.send(embed=embed, file=log_file)
+
+        try:
+            await channel.delete(reason=f"強制クローズ by {interaction.user}")
+        except Exception as e:
+            logger.error(f"Force close delete error: {e}")
+
+        await interaction.followup.send("✅ チケットを強制クローズしました。", ephemeral=True)
+        
 # --- 追加: 面接用のUIパネル ---
 class InterviewPanelView(discord.ui.View):
     def __init__(self, bot, routes, probation_role_id):
@@ -5732,7 +6409,7 @@ class CestaBankBot(commands.Bot):
         self.db_manager = BankDatabase(self.db_path)
         self.config = ConfigManager(self)
 
-    @contextlib.asynccontextmanager
+@contextlib.asynccontextmanager
     async def get_db(self):
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
@@ -5763,6 +6440,15 @@ class CestaBankBot(commands.Bot):
         
         if 'VCPanel' in globals():
             self.add_view(VCPanel())
+            self.add_view(PublicVCPanel())
+
+        # チケットパネルの永続化
+        async with self.get_db() as db:
+            async with db.execute("SELECT id FROM ticket_types") as c:
+                types = await c.fetchall()
+        if types:
+            self.add_view(TicketPanelView(self, [dict(t) for t in types]))
+        self.add_view(TicketCloseView(self))
         
         await self.add_cog(Economy(self))
         await self.add_cog(Salary(self))
@@ -5783,6 +6469,7 @@ class CestaBankBot(commands.Bot):
         await self.add_cog(Chinchiro(self))
         await self.add_cog(Blackjack(self))
         await self.add_cog(Countdown(self))
+        await self.add_cog(TicketSystem(self))
         
         if not self.backup_db_task.is_running():
             self.backup_db_task.start()
