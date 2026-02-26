@@ -230,13 +230,6 @@ class BankDatabase:
                 gini          REAL    DEFAULT 0
             )
         """)
-        for col, col_type in [("total_stell", "INTEGER DEFAULT 0"),
-                               ("total_cesta", "INTEGER DEFAULT 0"),
-                               ("gini", "REAL DEFAULT 0")]:
-            try:
-                await conn.execute(f"ALTER TABLE daily_stats ADD COLUMN {col} {col_type}")
-            except Exception:
-                pass  # カラムが既に存在する場合は無視
                 
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS stock_issuers (
@@ -1063,22 +1056,22 @@ class Economy(commands.Cog):
         user_id = interaction.user.id
         today   = datetime.datetime.now().strftime("%Y-%m-%d")
 
-        slot_limit      = await _cfg(self.bot, "slot_daily_limit")
+        bj_limit        = await _cfg(self.bot, "slot_daily_limit")
         chinchiro_limit = await _cfg(self.bot, "chinchiro_daily_limit")
 
         async with self.bot.get_db() as db:
             async with db.execute(
-                "SELECT count FROM daily_play_counts WHERE user_id=? AND game='slot' AND date=?",
+                "SELECT count FROM daily_play_counts WHERE user_id=? AND game='blackjack' AND date=?",
                 (user_id, today)
             ) as c:
                 row = await c.fetchone()
-            slot_count = row["count"] if row else 0
+            bj_count = row["count"] if row else 0
 
             async with db.execute(
-                "SELECT 1 FROM daily_play_exemptions WHERE user_id=? AND game='slot' AND date=?",
+                "SELECT 1 FROM daily_play_exemptions WHERE user_id=? AND game='blackjack' AND date=?",
                 (user_id, today)
             ) as c:
-                slot_exempt = bool(await c.fetchone())
+                bj_exempt = bool(await c.fetchone())
 
             async with db.execute(
                 "SELECT count FROM daily_play_counts WHERE user_id=? AND game='chinchiro' AND date=?",
@@ -1101,12 +1094,12 @@ class Economy(commands.Cog):
         )
         embed.add_field(
             name="🃏 ブラックジャック",
-            value="✨ 制限解除中" if slot_exempt else f"残り **{max(slot_limit - slot_count, 0)} / {slot_limit}** 回",
+            value="✨ 制限解除中" if bj_exempt else f"残り **{max(bj_limit - bj_count, 0)} / {bj_limit}** 回",
             inline=True
         )
         embed.set_footer(text="制限は毎日0時にリセットされます")
         await interaction.response.send_message(embed=embed, ephemeral=True)
-
+        
     # === ゴミ拾い ===
     @app_commands.command(name="ゴミ拾い", description="ゴミを拾ってStellを稼ぎます（残高500以下限定・1日30回まで）")
     async def gomi_hiroi(self, interaction: discord.Interaction):
@@ -1242,7 +1235,7 @@ class Economy(commands.Cog):
         embed.set_footer(text=f"実行者: {interaction.user.display_name} | Top 10 Richest Citizens")
         await interaction.followup.send(embed=embed)
 
-    # === 追加機能2: 資金の直接操作 ===
+# === 追加機能2: 資金の直接操作 ===
     @app_commands.command(name="資金操作", description="【最高神】指定したユーザーの所持金を直接増減させます")
     @app_commands.describe(
         target="操作対象のユーザー",
@@ -1263,16 +1256,13 @@ class Economy(commands.Cog):
         month_tag = datetime.datetime.now().strftime("%Y-%m")
 
         async with self.bot.get_db() as db:
-            # 対象の口座が存在しない場合は作成
             await db.execute("""
                 INSERT INTO accounts (user_id, balance, total_earned) VALUES (?, 0, 0)
                 ON CONFLICT(user_id) DO NOTHING
             """, (target.id,))
 
             if action == "add":
-                # 資金追加
                 await db.execute("UPDATE accounts SET balance = balance + ?, total_earned = total_earned + ? WHERE user_id = ?", (amount, amount, target.id))
-                # ログ追加 (システム(0)から対象へ)
                 await db.execute("""
                     INSERT INTO transactions (sender_id, receiver_id, amount, type, description, month_tag)
                     VALUES (0, ?, ?, 'SYSTEM_ADD', ?, ?)
@@ -1280,7 +1270,6 @@ class Economy(commands.Cog):
                 msg = f"✅ {target.mention} に **{amount:,} Stell** を付与しました。\n理由: `{reason}`"
             
             else:
-                # 資金削減 (現在の残高を取得してマイナスにならないよう調整)
                 async with db.execute("SELECT balance FROM accounts WHERE user_id = ?", (target.id,)) as c:
                     row = await c.fetchone()
                     current_bal = row['balance'] if row else 0
@@ -1288,15 +1277,33 @@ class Economy(commands.Cog):
                 actual_deduction = min(amount, current_bal)
                 
                 await db.execute("UPDATE accounts SET balance = balance - ? WHERE user_id = ?", (actual_deduction, target.id))
-                # ログ追加 (対象からシステム(0)へ)
                 await db.execute("""
                     INSERT INTO transactions (sender_id, receiver_id, amount, type, description, month_tag)
                     VALUES (?, 0, ?, 'SYSTEM_REMOVE', ?, ?)
                 """, (target.id, actual_deduction, f"【運営没収】{reason}", month_tag))
-                
                 msg = f"✅ {target.mention} から **{actual_deduction:,} Stell** を没収しました。\n理由: `{reason}`"
 
+            # ここを追加 ↓
+            async with db.execute("SELECT value FROM server_config WHERE key = 'currency_log_id'") as c:
+                row = await c.fetchone()
+                log_ch_id = int(row['value']) if row else None
+
             await db.commit()
+
+        embed = discord.Embed(title="⚙️ 運営資金操作ログ", color=0xff0000 if action == "remove" else 0x00ff00)
+        embed.add_field(name="対象", value=target.mention, inline=True)
+        embed.add_field(name="操作", value="➕ 付与" if action == "add" else "➖ 没収", inline=True)
+        embed.add_field(name="金額", value=f"**{amount:,} S**" if action == "add" else f"**{actual_deduction:,} S**", inline=True)
+        embed.add_field(name="理由", value=reason, inline=False)
+        embed.add_field(name="実行者", value=interaction.user.mention, inline=False)
+        embed.timestamp = datetime.datetime.now()
+
+        # ここを削除 ↓（元の2回目のget_dbブロックをこれに置き換え）
+        if log_ch_id:
+            channel = self.bot.get_channel(log_ch_id)
+            if channel: await channel.send(embed=embed)
+
+        await interaction.followup.send(msg, ephemeral=True)
             
         # 通貨ログチャンネルに通知を送る
         embed = discord.Embed(title="⚙️ 運営資金操作ログ", color=0xff0000 if action == "remove" else 0x00ff00)
@@ -4273,7 +4280,7 @@ class CestaShop(commands.Cog):
             embed.add_field(name=f"{uname} / {s['name']}", value=status, inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ── /セスタショップ_期限切れ処理 ──────────────────────
+# ── /セスタショップ_期限切れ処理 ──────────────────────
     @app_commands.command(name="セスタショップ_期限切れ処理", description="【管理者】期限切れロールを一括で剥奪します")
     @has_permission("SUPREME_GOD")
     async def shop_expire_roles(self, interaction: discord.Interaction):
@@ -4287,8 +4294,10 @@ class CestaShop(commands.Cog):
                 WHERE s.expiry < ?
             """, (now.isoformat(),)) as c:
                 expired = await c.fetchall()
+
         if not expired:
             return await interaction.followup.send("✅ 期限切れのロールはありません。", ephemeral=True)
+
         removed = []
         errors  = []
         async with self.bot.get_db() as db:
@@ -4302,16 +4311,20 @@ class CestaShop(commands.Cog):
                             removed.append(f"{user.display_name} / {e['name']}")
                         except Exception as ex:
                             errors.append(f"{e['user_id']}: {ex}")
-                    else:
-                        # ユーザーがサーバーにいない場合はDBだけ消してOK
-                        role_removed = True
+                            continue
 
-                    if role_removed:
-                        await db.execute(
-                            "DELETE FROM cesta_shop_subs WHERE user_id = ? AND item_id = ?",
-                            (e["user_id"], e["item_id"])
-                        )
+                await db.execute(
+                    "DELETE FROM cesta_shop_subs WHERE user_id = ? AND item_id = ?",
+                    (e["user_id"], e["item_id"])
+                )
             await db.commit()
+
+        lines = "\n".join(f"🗑️ {r}" for r in removed) or "なし"
+        embed = discord.Embed(title="🗑️ 期限切れ処理完了", color=0x9b59b6)
+        embed.add_field(name=f"剥奪({len(removed)}件)", value=lines, inline=False)
+        if errors:
+            embed.add_field(name="エラー", value="\n".join(errors), inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
             
         lines = "\n".join(f"🗑️ {r}" for r in removed) or "なし"
@@ -5503,7 +5516,7 @@ class AdminTools(commands.Cog):
     @app_commands.choices(log_type=[
         discord.app_commands.Choice(name="通貨ログ (送金など)", value="currency_log_id"),
         discord.app_commands.Choice(name="給与ログ (一斉支給)", value="salary_log_id"),
-        discord.app_commands.Choice(name="面接ログ (合格通知)", value="interview_log_id")
+        discord.app_commands.Choice(name="面接ログ (合格通知)", value="interview_log_id"),
         discord.app_commands.Choice(name="削除ログ (メッセージ削除)", value="delete_log_id")
     ])
     @has_permission("SUPREME_GOD")
@@ -5647,7 +5660,7 @@ class AdminTools(commands.Cog):
             return await interaction.followup.send("❌ ユーザーとロールは同時に指定できません。", ephemeral=True)
 
         today = datetime.datetime.now().strftime("%Y-%m-%d")
-        games = ["chinchiro", "slot"] if game == "all" else [game]
+        games = ["chinchiro", "blackjack"] if game == "all" else [game]
 
         # 対象メンバーリストを作成
         if target:
@@ -6409,7 +6422,7 @@ class CestaBankBot(commands.Bot):
         self.db_manager = BankDatabase(self.db_path)
         self.config = ConfigManager(self)
 
-@contextlib.asynccontextmanager
+    @contextlib.asynccontextmanager
     async def get_db(self):
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
@@ -6496,9 +6509,6 @@ class CestaBankBot(commands.Bot):
 
     @tasks.loop(hours=24)
     async def backup_db_task(self):
-        import datetime
-        import glob  # ファイル検索用
-        import os    # ファイル削除用
 
         # 1. 新しいバックアップを作成
         backup_name = f"backup_{datetime.datetime.now().strftime('%Y%m%d')}.db"
@@ -6526,8 +6536,8 @@ class CestaBankBot(commands.Bot):
             logger.error(f"Backup Failure: {e}")
 
     async def on_ready(self):
-        print(f"Logged in as {self.user} (ID: {self.user.id})")
-        print("--- Stella Bank System Online ---")
+        logger.info(f"Logged in as {self.user} (ID: {self.user.id})")
+        logger.info("--- Stella Bank System Online ---")
         
 # --- 実行ブロック ---
 if __name__ == "__main__":
