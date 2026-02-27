@@ -5107,11 +5107,12 @@ class ServerStats(commands.Cog):
         total = sum(s)
         return (2 * sum((i + 1) * v for i, v in enumerate(s)) / (n * total)) - (n + 1) / n
 
-    # ── 市民の残高リストを取得 ─────────────────────────────
+# ── 市民の残高リストを取得 ─────────────────────────────
     async def _get_citizen_balances(self) -> list[int]:
         guild = self.bot.guilds[0]
-        if not guild.chunked:
-            await guild.chunk()
+
+        # キャッシュを強制更新（これが核心の修正）
+        await guild.chunk()
 
         async with self.bot.get_db() as db:
             async with db.execute(
@@ -5131,8 +5132,17 @@ class ServerStats(commands.Cog):
         balances = []
         for row in all_accounts:
             uid, bal = row["user_id"], row["balance"]
+            # get_member失敗時はfetch_memberでAPIから直接取得
             member = guild.get_member(uid)
-            if not member or member.bot:
+            if member is None:
+                try:
+                    member = await guild.fetch_member(uid)
+                except discord.NotFound:
+                    continue  # 既にサーバーを抜けたユーザー
+                except Exception:
+                    continue
+
+            if member.bot:
                 continue
             if any(r.id in god_role_ids for r in member.roles):
                 continue
