@@ -635,7 +635,7 @@ class PublicPlanSelect(discord.ui.Select):
 
             # 除外ロールは拒否、それ以外は全員OK
             overwrites = {
-                guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True),
+                guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True, send_messages=True, attach_files=True, use_voice_activation=True),
                 guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True),
                 user: discord.PermissionOverwrite(
                     view_channel=True, connect=True, speak=True, stream=True,
@@ -5111,7 +5111,8 @@ class ServerStats(commands.Cog):
 # ── 市民の残高リストを取得 ─────────────────────────────
     async def _get_citizen_balances(self) -> list[int]:
         guild = self.bot.guilds[0]
-        await guild.chunk()
+        if not guild.chunked:
+            await guild.chunk()
         member_map = {m.id: m for m in guild.members}
 
         async with self.bot.get_db() as db:
