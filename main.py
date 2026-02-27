@@ -5089,6 +5089,7 @@ class HumanStockMarket(commands.Cog):
         embed.set_footer(text="株を買うと価格が上がり、売ると下がります。推しをスターに押し上げよう！")
         await interaction.followup.send(embed=embed)
 
+
 class ServerStats(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -5110,9 +5111,8 @@ class ServerStats(commands.Cog):
 # ── 市民の残高リストを取得 ─────────────────────────────
     async def _get_citizen_balances(self) -> list[int]:
         guild = self.bot.guilds[0]
-
-        # キャッシュを強制更新（これが核心の修正）
         await guild.chunk()
+        member_map = {m.id: m for m in guild.members}
 
         async with self.bot.get_db() as db:
             async with db.execute(
@@ -5132,17 +5132,8 @@ class ServerStats(commands.Cog):
         balances = []
         for row in all_accounts:
             uid, bal = row["user_id"], row["balance"]
-            # get_member失敗時はfetch_memberでAPIから直接取得
-            member = guild.get_member(uid)
-            if member is None:
-                try:
-                    member = await guild.fetch_member(uid)
-                except discord.NotFound:
-                    continue  # 既にサーバーを抜けたユーザー
-                except Exception:
-                    continue
-
-            if member.bot:
+            member = member_map.get(uid)
+            if not member or member.bot:
                 continue
             if any(r.id in god_role_ids for r in member.roles):
                 continue
@@ -5150,7 +5141,7 @@ class ServerStats(commands.Cog):
                 continue
             balances.append(bal)
         return balances
-
+        
     # ── 24時間タスク ──────────────────────────────────────
     @tasks.loop(hours=24)
     async def daily_log_task(self):
@@ -5182,6 +5173,10 @@ class ServerStats(commands.Cog):
         except Exception as e:
             logger.error(f"Daily Log Error: {e}")
 
+    @daily_log_task.before_loop
+    async def before_daily_log(self):
+        await self.bot.wait_until_ready()
+        
     # ── /経済レポート ──────────────────────────────────────
     @app_commands.command(name="経済レポート", description="サーバー経済の現状レポートを表示します")
     @has_permission("ADMIN")
